@@ -26,7 +26,6 @@ MCP client (AI Playground, Claude Code, Cursor, agent)
 │ 2. Serving endpoint: question-ranking-router│   resources/serving.yml
 │    50% system.ai.llama_v3_2_3b_instruct     │
 │    50% system.ai.mistral_7b_instruct_v0_2   │
-│    + AI Gateway usage tracking & rate limit │
 └─────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────┐
@@ -135,6 +134,9 @@ Only if you also opt into UC MCP registration (see below):
 ```sql
 GRANT CREATE CONNECTION, CREATE SERVICE, USE SCHEMA
   ON SCHEMA prod_ai.`question-ranking-mcp` TO `agents-deploy`;
+
+-- Only if you also pass a bearer token via mcp_bearer_token_secret:
+GRANT READ_SECRET ON SECRET <catalog>.<schema>.<secret> TO `agents-deploy`;
 ```
 
 Note the backticks. Hyphens are legal in a UC schema name, and the bundle YAML takes the
@@ -154,15 +156,32 @@ literal `question-ranking-mcp`, but **SQL requires backtick-quoting**:
 databricks bundle validate -t dev  --profile <your-profile>
 databricks bundle validate -t prod --profile <prod-profile>
 
-# Deploy. `dev` uses mode: development, which prefixes resource names per user.
+# Deploy. One command: `lifecycle.started: true` on the app means deploy also starts it,
+# so no separate `databricks apps start` is needed.
 databricks bundle deploy -t dev  --profile <your-profile>
 databricks bundle deploy -t prod --profile <prod-profile>
 
-# Start the app (deploy creates it; it does not start it).
-databricks apps start mcp-question-ranking --profile <prod-profile>
-
 # Find the app URL.
 databricks apps get mcp-question-ranking --profile <prod-profile> | jq -r .url
+```
+
+### App names in `dev`
+
+`mode: development` prefixes most resource names per user but **not** app names, because
+app names are restricted to lowercase letters, digits and hyphens with a 30-character
+limit — and `bundle validate` enforces neither rule. The `dev` target therefore builds the
+name itself as `mcp-qrank-${workspace.current_user.domain_friendly_name}` (for example
+`mcp-qrank-pedro-perdomo`, 23 characters). It uses `domain_friendly_name` rather than
+`short_name` because `short_name` keeps underscores (`pedro_perdomo`), which are illegal
+in an app name.
+
+That leaves 20 characters for the suffix. If your sanitised username is longer, override it:
+
+```bash
+databricks bundle deploy -t dev --profile <your-profile> --var dev_app_suffix=<short>
+
+# or replace the whole name, which takes precedence:
+databricks bundle deploy -t dev --profile <your-profile> --var app_name=mcp-<something>
 ```
 
 The endpoint provisions GPU capacity and can take several minutes to go green:
@@ -257,7 +276,7 @@ to a **dry run**, so `databricks bundle deploy` always succeeds. To attempt it:
 ```bash
 databricks bundle deploy -t prod --profile <prod-profile> \
   --var register_uc_mcp_service=true \
-  --var mcp_bearer_token_secret=<scope>/<key>
+  --var mcp_bearer_token_secret=<catalog>.<schema>.<secret>
 
 databricks bundle run register_uc_mcp -t prod --profile <prod-profile>
 ```
@@ -267,6 +286,27 @@ execute and exits cleanly. With it set to `true` it resolves the deployed app's 
 creates the schema-level HTTP connection, then calls `create-mcp-service`. **If Unity
 Catalog rejects that call, the job fails with a message pointing back at this section.**
 That is the documented limitation, not a defect in the bundle.
+
+### The bearer token must be a Unity Catalog Secret
+
+`mcp_bearer_token_secret` takes a **Unity Catalog Secret** as a three-level fully
+qualified name, `<catalog>.<schema>.<secret>` — the form that
+`connections.create(secrets=...)` documents ("UC Secret fully qualified names") and that
+`secrets_uc.get_secret` accepts.
+
+It is **not** a workspace secret scope. A `<scope>/<key>` path, with or without a
+`secrets/` prefix, is a different and incompatible namespace; the job validates the format
+up front and rejects it with an explicit message rather than letting it fail opaquely
+inside the connections API. The job also preflights the secret with
+`secrets_uc.get_secret` so a missing secret or a missing `READ_SECRET` grant produces a
+clear error instead of a confusing connection failure.
+
+> One ambiguity worth flagging, since it is unverified against a live workspace: a sibling
+> API (model provider services) documents its secret references in the **resource-name**
+> form `secrets/{catalog}.{schema}.{secret}`, while the connections `secrets` map is
+> documented as a bare fully qualified name. This bundle follows the connections API's own
+> wording. If a real registration attempt ever gets far enough to reject the secret
+> reference specifically, try the `secrets/`-prefixed form.
 
 If a future release does support it, the MCP would be consumed as:
 

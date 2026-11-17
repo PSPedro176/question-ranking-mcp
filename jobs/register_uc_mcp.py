@@ -20,7 +20,7 @@
 import json
 
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.errors import DatabricksError
+from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import (
     ConnectionType,
     McpService,
@@ -52,7 +52,14 @@ BASE_PATH = dbutils.widgets.get("base_path").strip() or "/mcp"  # noqa: F821
 REGISTER = dbutils.widgets.get("register").strip().lower() == "true"  # noqa: F821
 
 PARENT = f"schemas/{CATALOG}.{SCHEMA}"
-CONNECTION_RESOURCE = f"connections/{CATALOG}.{SCHEMA}.{CONNECTION_NAME}"
+
+# Two forms of the same connection, deliberately kept apart:
+#   CONNECTION_FULL_NAME - three-level name. `connections.get()` interpolates it straight
+#       into /api/2.1/unity-catalog/connections/{name}, so the `connections/` prefix must
+#       NOT be included or the request path doubles up and the lookup always 404s.
+#   CONNECTION_RESOURCE  - resource name. Required by McpServiceConfigSourceConnection.
+CONNECTION_FULL_NAME = f"{CATALOG}.{SCHEMA}.{CONNECTION_NAME}"
+CONNECTION_RESOURCE = f"connections/{CONNECTION_FULL_NAME}"
 MCP_RESOURCE = f"mcp-services/{CATALOG}.{SCHEMA}.{MCP_SERVICE_ID}"
 
 w = WorkspaceClient()
@@ -77,7 +84,7 @@ print(
         {
             "plan": {
                 "parent": PARENT,
-                "connection": CONNECTION_RESOURCE,
+                "connection": CONNECTION_FULL_NAME,
                 "mcp_service": MCP_RESOURCE,
                 "app": APP_NAME,
                 "app_url": app_url,
@@ -114,14 +121,48 @@ if not app_url:
 options = {"host": app_url, "port": "443", "base_path": BASE_PATH}
 secrets = None
 
-if BEARER_TOKEN_SECRET:
-    # Format: "<scope>/<key>" -> the UC secret FQN the connection should read.
-    scope, _, key = BEARER_TOKEN_SECRET.partition("/")
-    if not key:
+
+def resolve_uc_secret(reference: str) -> str:
+    """Validate a Unity Catalog Secret reference and confirm it exists.
+
+    `connections.create(secrets=...)` maps a connection option name to a **UC Secret
+    fully qualified name** - a three-level `catalog.schema.secret`. It is NOT a workspace
+    secret-scope path: `<scope>/<key>` and `secrets/<scope>/<key>` are a different,
+    incompatible namespace and are rejected here rather than passed on to fail opaquely.
+
+    Note the sibling convention: model provider services take the resource-name form
+    `secrets/{catalog}.{schema}.{secret}`, but the connections `secrets` map is documented
+    as a bare fully qualified name, which is what `secrets_uc.get_secret` also takes.
+    """
+    if "/" in reference:
         raise ValueError(
-            f"bearer_token_secret must be '<scope>/<key>', got {BEARER_TOKEN_SECRET!r}"
+            f"bearer_token_secret must be a Unity Catalog Secret fully qualified name "
+            f"'<catalog>.<schema>.<secret>', got {reference!r}.\n"
+            "A workspace secret-scope path ('<scope>/<key>' or 'secrets/<scope>/<key>') is a "
+            "different namespace and is not accepted by the Unity Catalog connections API. "
+            "Create a UC Secret instead, then pass its three-level name."
         )
-    secrets = {"bearer_token": f"secrets/{scope}/{key}"}
+    parts = reference.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(
+            f"bearer_token_secret must have exactly three non-empty parts "
+            f"'<catalog>.<schema>.<secret>', got {reference!r}."
+        )
+
+    # Preflight: turn an opaque downstream connection error into an actionable one.
+    try:
+        w.secrets_uc.get_secret(full_name=reference)
+    except NotFound as exc:
+        raise ValueError(
+            f"Unity Catalog Secret {reference!r} does not exist (or is not visible to this "
+            f"identity): {exc}\nCreate it, and grant this identity READ_SECRET on it."
+        ) from exc
+    print(f"Verified UC Secret exists: {reference}")
+    return reference
+
+
+if BEARER_TOKEN_SECRET:
+    secrets = {"bearer_token": resolve_uc_secret(BEARER_TOKEN_SECRET)}
 else:
     print(
         "WARNING: no bearer_token_secret supplied. 'bearer_token' is a required option for "
@@ -131,12 +172,10 @@ else:
     )
 
 try:
-    existing = w.connections.get(name=CONNECTION_RESOURCE)
-    print(f"Connection already exists, reusing: {existing.full_name or CONNECTION_RESOURCE}")
-except DatabricksError as exc:
-    if "does not exist" not in str(exc).lower() and "not found" not in str(exc).lower():
-        raise
-    print(f"Creating HTTP connection {CONNECTION_RESOURCE} -> {app_url}{BASE_PATH}")
+    existing = w.connections.get(name=CONNECTION_FULL_NAME)
+    print(f"Connection already exists, reusing: {existing.full_name or CONNECTION_FULL_NAME}")
+except NotFound:
+    print(f"Creating HTTP connection {CONNECTION_FULL_NAME} -> {app_url}{BASE_PATH}")
     w.connections.create(
         name=CONNECTION_NAME,
         connection_type=ConnectionType.HTTP,
@@ -154,9 +193,8 @@ try:
     existing_mcp = w.ai_gateway.get_mcp_service(name=MCP_RESOURCE)
     print(f"MCP service already exists, nothing to do: {existing_mcp.name}")
     dbutils.notebook.exit("already-registered")  # noqa: F821
-except DatabricksError as exc:
-    if "does not exist" not in str(exc).lower() and "not found" not in str(exc).lower():
-        raise
+except NotFound:
+    pass
 
 print(f"Creating MCP service {MCP_RESOURCE}")
 try:

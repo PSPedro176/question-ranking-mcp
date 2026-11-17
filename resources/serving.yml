@@ -16,10 +16,10 @@ resources:
         Routes question-ranking prompts 50/50 across two open-source models so the MCP
         server's scores are not tied to a single model's bias.
 
-      # Targets that set a top-level `permissions` block (see `prod` in databricks.yml)
-      # overwrite this endpoint's ACL on deploy, which would silently strip the CAN_QUERY
-      # grant the app's `serving_endpoint` resource creates. Declaring the app's runtime
-      # service principal here keeps the grant through every deploy.
+      # The app's `serving_endpoint` resource block (resources/app.yml) is what actually
+      # grants the app's runtime service principal CAN_QUERY. Restating it here makes the
+      # grant explicit and keeps it intact if a target ever gains a top-level `permissions`
+      # block, which would otherwise overwrite this endpoint's ACL on deploy.
       permissions:
         - level: CAN_QUERY
           service_principal_name: ${resources.apps.question_ranking_mcp.service_principal_client_id}
@@ -47,13 +47,3 @@ resources:
               traffic_percentage: 50
             - served_model_name: model-b
               traffic_percentage: 50
-
-      # AI Gateway: usage tracking writes request/token metrics to system tables, and the
-      # rate limit keeps a runaway MCP client from draining the demo budget.
-      ai_gateway:
-        usage_tracking_config:
-          enabled: true
-        rate_limits:
-          - key: endpoint
-            renewal_period: minute
-            calls: 120

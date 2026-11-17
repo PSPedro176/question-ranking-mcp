@@ -8,6 +8,12 @@ resources:
       name: ${var.app_name}
       description: MCP server exposing question-ranking tools over streamable HTTP at /mcp.
 
+      # `databricks bundle deploy` creates an app but leaves it stopped by default, which
+      # would mean no running MCP server until someone also ran `databricks apps start`.
+      # `started: true` makes deploy bring it up, keeping the one-command contract.
+      lifecycle:
+        started: true
+
       # Relative to THIS file, so app/ sits one level up.
       source_code_path: ../app
 

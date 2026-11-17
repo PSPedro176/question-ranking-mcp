@@ -66,6 +66,15 @@ variables:
       for mistral_7b_instruct_v0_2 (2450).
     default: 2450
 
+  dev_app_suffix:
+    description: >-
+      Per-developer suffix for the `dev` app name, keeping two people deploying `dev` to one
+      workspace from colliding. Override it when your sanitised username is long enough to
+      push the name past the 30-character App limit:
+      `databricks bundle validate -t dev --var dev_app_suffix=<short>`.
+      Overriding `app_name` outright also works and takes precedence.
+    default: ${workspace.current_user.domain_friendly_name}
+
   # --- Unity Catalog MCP registration (opt-in) ------------------------------------------
   register_uc_mcp_service:
     description: >-
@@ -85,10 +94,12 @@ variables:
 
   mcp_bearer_token_secret:
     description: >-
-      Optional "<scope>/<key>" pointing at a Databricks secret holding the bearer token for
-      the UC HTTP connection. `bearer_token` is a required HTTP-connection option, but
-      Databricks Apps MCP endpoints require OAuth and reject static bearer tokens - see the
-      README's Unity Catalog registration section.
+      Optional Unity Catalog Secret, as a three-level fully qualified name
+      "<catalog>.<schema>.<secret>", holding the bearer token for the UC HTTP connection.
+      This is a UC Secret, NOT a workspace secret scope: a "<scope>/<key>" path is a
+      different namespace and the job rejects it with an explicit error. `bearer_token` is a
+      required HTTP-connection option, but Databricks Apps MCP endpoints require OAuth and
+      reject static bearer tokens - see the README's Unity Catalog registration section.
     default: ""
 
 targets:
@@ -103,7 +114,13 @@ targets:
       # `mode: development` prefixes most resource names automatically but NOT app names,
       # because app names have a restricted charset. Suffix it manually so two developers
       # deploying `dev` to the same workspace do not fight over one app.
-      app_name: mcp-question-ranking-${workspace.current_user.short_name}
+      #
+      # App names allow only lowercase letters, digits and hyphens, with a 30-character
+      # limit, and `bundle validate` does NOT enforce either rule. Hence the short
+      # `mcp-qrank-` prefix (10 chars, 20 left for the suffix) and `domain_friendly_name`
+      # rather than `short_name`: short_name keeps underscores (`pedro_perdomo`), which are
+      # illegal, while domain_friendly_name is hyphen-sanitised (`pedro-perdomo`).
+      app_name: mcp-qrank-${var.dev_app_suffix}
 
   # The real deploy target. Nobody has a local profile for this host yet, so `prod` cannot
   # be validated or deployed until the `agents-deploy` service principal exists.
@@ -115,6 +132,8 @@ targets:
       # Scoping it to the deploying identity (the `agents-deploy` SP in a real deploy) keeps
       # it restricted; a /Workspace/Shared root would be writable by every workspace user.
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
-    permissions:
-      - level: CAN_MANAGE
-        service_principal_name: agents-deploy
+    # No top-level `permissions` block on purpose. The deploying identity already owns and
+    # manages everything it creates, and naming `agents-deploy` here would force the CLI to
+    # resolve a principal that does not exist yet. It would also overwrite the serving
+    # endpoint's ACL on deploy, stripping the CAN_QUERY that the app's resource block grants
+    # to the app's runtime service principal.
