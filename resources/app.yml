@@ -1,0 +1,40 @@
+# Component 1 of 3: the custom MCP server on Databricks Apps.
+#
+# Serves streamable HTTP MCP at https://<app-url>/mcp. The `mcp-` name prefix is what makes
+# the AI Playground offer it in the MCP server picker.
+resources:
+  apps:
+    question_ranking_mcp:
+      name: ${var.app_name}
+      description: MCP server exposing question-ranking tools over streamable HTTP at /mcp.
+
+      # Relative to THIS file, so app/ sits one level up.
+      source_code_path: ../app
+
+      # Needed for on-behalf-of-user calls: Apps only forwards the end user's token in the
+      # `x-forwarded-access-token` header when a scope is declared. The `whoami` tool reads
+      # it. MCP callers must use OAuth; personal access tokens are not supported.
+      user_api_scopes:
+        - iam.current-user:read
+
+      # This block mirrors app/app.yaml. NOTE the casing difference, which is real and
+      # intentional: DABs uses snake_case `value_from` here, while app/app.yaml uses
+      # camelCase `valueFrom`.
+      config:
+        command: ["uv", "run", "question-ranking-mcp"]
+        env:
+          - name: SERVING_ENDPOINT
+            value_from: ranking-endpoint
+
+      # Grants the app's own runtime service principal CAN_QUERY on the 50/50 endpoint and
+      # resolves the endpoint name into SERVING_ENDPOINT above.
+      #
+      # This references the RESOURCE, not ${var.endpoint_name}: in `mode: development` DABs
+      # renames the endpoint to `dev_<user>_<name>`, and a bare variable would point the app
+      # at an endpoint that does not exist in that target.
+      resources:
+        - name: ranking-endpoint
+          description: The 50/50 question-ranking endpoint this MCP server scores against.
+          serving_endpoint:
+            name: ${resources.model_serving_endpoints.ranking_router.name}
+            permission: CAN_QUERY

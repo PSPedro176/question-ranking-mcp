@@ -1,0 +1,52 @@
+# Component 3 of 3: Unity Catalog.
+#
+# The schema is declarative. The MCP-service registration is a JOB, not a
+# `resources.mcp_services` block, for two reasons:
+#
+#   1. A UC MCP service requires a pre-existing schema-level HTTP connection, and there is
+#      NO `connections` DABs resource type (verified against `databricks bundle schema`).
+#      A declarative `mcp_services` block would therefore fail on a clean deploy, since
+#      nothing can create the connection first.
+#   2. Databricks documents Databricks Apps as an unsupported MCP registration source. As a
+#      job, a rejection fails one run; as a declarative resource it would fail every
+#      `databricks bundle deploy`.
+#
+# The job defaults to a dry run, so `databricks bundle deploy` is always safe.
+resources:
+  schemas:
+    mcp_schema:
+      catalog_name: ${var.catalog}
+      name: ${var.schema}
+      comment: Hosts the question-ranking MCP service registration and AI Gateway artifacts.
+
+  jobs:
+    register_uc_mcp:
+      name: ${bundle.name}-register-uc-mcp
+      description: >-
+        Idempotently creates the UC HTTP connection and MCP service for the deployed app.
+        Dry run unless var.register_uc_mcp_service is true.
+      max_concurrent_runs: 1
+
+      parameters:
+        - name: register
+          default: ${var.register_uc_mcp_service}
+        - name: catalog
+          default: ${var.catalog}
+        # Resource reference, not ${var.schema}: `mode: development` renames the schema,
+        # and the job must target the schema that actually got deployed.
+        - name: schema
+          default: ${resources.schemas.mcp_schema.name}
+        - name: app_name
+          default: ${resources.apps.question_ranking_mcp.name}
+        - name: connection_name
+          default: ${var.uc_connection_name}
+        - name: mcp_service_id
+          default: ${var.mcp_service_id}
+        - name: bearer_token_secret
+          default: ${var.mcp_bearer_token_secret}
+
+      tasks:
+        - task_key: register
+          # No compute block: the task runs on serverless.
+          notebook_task:
+            notebook_path: ../jobs/register_uc_mcp.py

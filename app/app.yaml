@@ -1,0 +1,10 @@
+# Databricks Apps runtime config.
+# NOTE: this file uses camelCase `valueFrom`. The DABs equivalent in
+# resources/app.yml uses snake_case `value_from`. Both are real and different.
+command: ["uv", "run", "question-ranking-mcp"]
+
+env:
+  # Resolved from the app's `ranking-endpoint` serving_endpoint resource,
+  # declared in resources/app.yml.
+  - name: SERVING_ENDPOINT
+    valueFrom: ranking-endpoint

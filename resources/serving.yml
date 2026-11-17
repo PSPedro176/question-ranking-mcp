@@ -1,0 +1,59 @@
+# Component 2 of 3: the 50/50 traffic-split Model Serving endpoint.
+#
+# Why two provisioned-throughput entities rather than pay-per-token Foundation Model
+# endpoints: pay-per-token FM endpoints cannot be traffic-split (there is no pay-per-token
+# served-entity form), and a single endpoint may not mix model types. So the split has to
+# live on our own endpoint with two provisioned-throughput `system.ai.*` entities drawn
+# from the same throughput-band scaling family.
+#
+# min_provisioned_throughput: 0 lets both entities scale to zero, and each
+# max_provisioned_throughput is exactly one throughput chunk - the cheapest valid config.
+resources:
+  model_serving_endpoints:
+    ranking_router:
+      name: ${var.endpoint_name}
+      description: >-
+        Routes question-ranking prompts 50/50 across two open-source models so the MCP
+        server's scores are not tied to a single model's bias.
+
+      # Targets that set a top-level `permissions` block (see `prod` in databricks.yml)
+      # overwrite this endpoint's ACL on deploy, which would silently strip the CAN_QUERY
+      # grant the app's `serving_endpoint` resource creates. Declaring the app's runtime
+      # service principal here keeps the grant through every deploy.
+      permissions:
+        - level: CAN_QUERY
+          service_principal_name: ${resources.apps.question_ranking_mcp.service_principal_client_id}
+
+      config:
+        served_entities:
+          # `name` is set explicitly on both entities because traffic_config routes
+          # reference it by exact string match. Leaving it implicit makes the route
+          # silently fail to bind.
+          - name: model-a
+            entity_name: ${var.model_a_name}
+            entity_version: ${var.model_a_version}
+            min_provisioned_throughput: 0
+            max_provisioned_throughput: ${var.model_a_max_throughput}
+
+          - name: model-b
+            entity_name: ${var.model_b_name}
+            entity_version: ${var.model_b_version}
+            min_provisioned_throughput: 0
+            max_provisioned_throughput: ${var.model_b_max_throughput}
+
+        traffic_config:
+          routes:
+            - served_model_name: model-a
+              traffic_percentage: 50
+            - served_model_name: model-b
+              traffic_percentage: 50
+
+      # AI Gateway: usage tracking writes request/token metrics to system tables, and the
+      # rate limit keeps a runaway MCP client from draining the demo budget.
+      ai_gateway:
+        usage_tracking_config:
+          enabled: true
+        rate_limits:
+          - key: endpoint
+            renewal_period: minute
+            calls: 120

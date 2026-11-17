@@ -1,0 +1,38 @@
+# Root dev workspace. The deployable app lives in app/ with its own pyproject;
+# this file exists only to run ruff and pytest over the repo.
+[project]
+name = "question-ranking-mcp-dev"
+version = "0.1.0"
+description = "Dev tooling for the question-ranking MCP bundle"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.0",
+    "pytest>=8",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".databricks"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "BLE",  # blind except
+    "RUF",  # ruff-specific
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+# Tests import `server.ranking` directly; the pure logic has no third-party deps.
+pythonpath = ["app"]
+testpaths = ["tests"]

@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -q
+
+      # `databricks bundle validate` is deliberately NOT run here: it authenticates
+      # against a live workspace to resolve the deploy identity, and this repo has no
+      # workspace secrets. Run it locally instead:
+      #   databricks bundle validate -t dev --profile <your-profile>
