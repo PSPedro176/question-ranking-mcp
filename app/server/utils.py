@@ -13,11 +13,6 @@ header_store: contextvars.ContextVar[dict] = contextvars.ContextVar("header_stor
 USER_TOKEN_HEADER = "x-forwarded-access-token"
 
 
-def get_workspace_client() -> WorkspaceClient:
-    """Client authenticated as the app's own service principal."""
-    return WorkspaceClient()
-
-
 def get_user_authenticated_workspace_client() -> WorkspaceClient:
     """Client authenticated on behalf of the calling user.
 

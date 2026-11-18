@@ -3,12 +3,17 @@ name = "question-ranking-mcp"
 version = "0.1.0"
 description = "MCP server that ranks questions using a 50/50 open-source model endpoint"
 requires-python = ">=3.11"
+# Floors are the versions in app/uv.lock that the test suite runs against; ceilings
+# stop a future lock refresh from silently crossing a major. fastmcp matters most:
+# its `@tool` decorator semantics changed across majors (see server/tools.py).
+# At runtime app.yaml runs `uv run --frozen`, so the deployed set is exactly
+# app/uv.lock regardless of these ranges.
 dependencies = [
-    "fastapi>=0.115.12",
-    "fastmcp>=2.12.5",
-    "uvicorn>=0.34.2",
-    "databricks-sdk>=0.60.0",
-    "pydantic>=2",
+    "fastmcp>=4.2,<5",
+    "fastapi>=0.162,<1",
+    "uvicorn>=0.54,<1",
+    "databricks-sdk>=0.167,<1",
+    "pydantic>=2.14,<3",
 ]
 
 [project.scripts]

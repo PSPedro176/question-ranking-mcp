@@ -8,6 +8,7 @@ tools in :mod:`server.tools` own all I/O; this module owns all decisions.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -19,6 +20,14 @@ MAX_SCORE = 10.0
 #: Score used when the model returns nothing usable for a question.
 FALLBACK_SCORE = 5.0
 FALLBACK_RATIONALE = "No model score returned; assigned a neutral default."
+
+#: Upper bound on how much model output is parsed. Generous next to the
+#: endpoint's ``max_tokens``, and it bounds the salvage pass's worst case.
+MAX_RESPONSE_CHARS = 20_000
+
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+_INDEX_TEXT = re.compile(r"[0-9]{1,6}")
+_WRAPPER_KEYS = ("questions", "results", "rankings", "scores", "items", "data")
 
 
 class InvalidQuestions(ValueError):
@@ -86,35 +95,79 @@ def validate_questions(questions: object) -> list[str]:
     return cleaned
 
 
-def clamp_score(value: object) -> float | None:
-    """Coerce ``value`` to a float clamped into ``[MIN_SCORE, MAX_SCORE]``.
+def _finite_float(value: object) -> float | None:
+    """Convert a JSON scalar to a finite float, or ``None``. Never raises.
 
-    Returns ``None`` when the value is not numeric at all, so callers can tell
-    "the model said 0" apart from "the model said nothing".
+    Python's JSON decoder accepts ``NaN``, ``Infinity`` and literals like ``1e999``
+    (which overflow to ``inf``), and arbitrarily long integers that overflow
+    ``float()``. All of those are treated as unusable rather than propagated.
     """
     if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-    elif isinstance(value, str):
-        match = re.search(r"-?\d+(?:\.\d+)?", value)
-        if not match:
+    try:
+        if isinstance(value, (int, float)):
+            number = float(value)
+        elif isinstance(value, str):
+            match = _NUMBER.search(value)
+            if not match:
+                return None
+            number = float(match.group(0))
+        else:
             return None
-        number = float(match.group(0))
-    else:
+    except (OverflowError, ValueError):
         return None
-    if number != number or number in (float("inf"), float("-inf")):  # NaN / inf
+    return number if math.isfinite(number) else None
+
+
+def clamp_score(value: object) -> float | None:
+    """Coerce ``value`` to a float clamped into ``[MIN_SCORE, MAX_SCORE]``.
+
+    Returns ``None`` when the value is not a usable finite number, so callers
+    can tell "the model said 0" apart from "the model said nothing".
+    """
+    number = _finite_float(value)
+    if number is None:
         return None
     return max(MIN_SCORE, min(MAX_SCORE, round(number, 2)))
 
 
-def _extract_json_payload(text: str) -> object | None:
-    """Pull the first JSON object or array out of a model response.
+def clamp_index(value: object, question_count: int) -> int | None:
+    """Convert a model-reported 1-based index into a 0-based list offset.
 
-    Handles bare JSON, ```json fenced blocks, and JSON with leading or trailing
-    prose, which are the three shapes small instruct models actually emit.
+    Only a genuinely integral, positive, in-range index is accepted: an ``int``,
+    an integral finite ``float`` such as ``2.0``, or a plain digit string such as
+    ``"2"``. Negative, fractional, non-finite and non-numeric values return
+    ``None`` instead of being truncated or partially matched. Never raises.
     """
-    stripped = text.strip()
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        number = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not _INDEX_TEXT.fullmatch(text):
+            return None
+        number = int(text)
+    else:
+        return None
+    if 1 <= number <= question_count:
+        return number - 1
+    return None
+
+
+def _extract_json_payload(text: str) -> object | None:
+    """Pull JSON out of a model response. Never raises.
+
+    Tries, in order: a ```json fenced block, the whole response, then a salvage
+    pass that decodes each complete JSON object in sequence. The salvage pass
+    recovers rows from a truncated array (the model hit ``max_tokens``) and from
+    JSON wrapped in prose.
+    """
+    stripped = (text or "").strip()[:MAX_RESPONSE_CHARS]
     if not stripped:
         return None
 
@@ -125,66 +178,82 @@ def _extract_json_payload(text: str) -> object | None:
     for candidate in candidates:
         try:
             return json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
+        except (ValueError, RecursionError):
             pass
-        for opener, closer in (("[", "]"), ("{", "}")):
-            start = candidate.find(opener)
-            end = candidate.rfind(closer)
-            if start != -1 and end > start:
-                try:
-                    return json.loads(candidate[start : end + 1])
-                except (json.JSONDecodeError, ValueError):
-                    continue
-    return None
+
+    decoder = json.JSONDecoder()
+    source = candidates[0]
+    objects: list[dict] = []
+    pos = source.find("{")
+    while pos != -1:
+        try:
+            obj, end = decoder.raw_decode(source, pos)
+        except (ValueError, RecursionError):
+            pos = source.find("{", pos + 1)
+            continue
+        if isinstance(obj, dict):
+            objects.append(obj)
+        pos = source.find("{", end)
+    return objects or None
 
 
 def _coerce_rows(payload: object) -> list[dict]:
-    """Normalise the many shapes a model may wrap its rows in into a list."""
+    """Normalise the shapes a model may wrap its rows in into a flat list.
+
+    A dict is treated as a wrapper only when it carries no ``score`` of its own,
+    so a row that happens to include a list-valued field is never discarded.
+    """
     if isinstance(payload, dict):
-        for key in ("questions", "results", "rankings", "scores", "items", "data"):
-            nested = payload.get(key)
-            if isinstance(nested, list):
-                return [row for row in nested if isinstance(row, dict)]
+        if "score" not in payload:
+            for key in _WRAPPER_KEYS:
+                nested = payload.get(key)
+                if isinstance(nested, list):
+                    return [row for row in nested if isinstance(row, dict)]
         return [payload]
     if isinstance(payload, list):
-        return [row for row in payload if isinstance(row, dict)]
+        rows: list[dict] = []
+        for item in payload:
+            if isinstance(item, dict):
+                rows.extend(_coerce_rows(item))
+        return rows
     return []
 
 
 def parse_scores(response_text: str, question_count: int) -> list[ScoredItem]:
     """Parse model output into one :class:`ScoredItem` per input question.
 
-    Rows are keyed back to the input list by the model's 1-based ``index``
-    field; rows whose index is missing, duplicated or out of range fall back to
-    positional order. Questions the model never scored get ``matched=False``.
+    A score is only ever attached to the question the model attributed it to.
+    The index policy, applied to rows with a usable score:
+
+    1. A row with a valid explicit ``index`` claims that question. The first
+       claim wins; a later row repeating the same index is discarded - it is
+       never moved onto a different question.
+    2. A row whose ``index`` is present but invalid (out of range, negative,
+       fractional, non-finite or non-numeric) is discarded.
+    3. Rows without an index are matched by position ONLY when no row in the
+       response carries an index AND the row count equals the question count,
+       i.e. the model plainly answered every question in order. Any other mix
+       is ambiguous, so index-less rows are discarded.
+
+    Questions left unclaimed get ``FALLBACK_SCORE`` with ``matched=False``.
+    Never raises, whatever the model returned.
     """
     if question_count <= 0:
         return []
 
-    rows = _coerce_rows(_extract_json_payload(response_text or ""))
-    items: dict[int, ScoredItem] = {}
-    unplaced: list[tuple[float, str]] = []
+    rows = _coerce_rows(_extract_json_payload(response_text))
+    positional = len(rows) == question_count and all(row.get("index") is None for row in rows)
 
+    items: dict[int, ScoredItem] = {}
     for position, row in enumerate(rows):
         score = clamp_score(row.get("score"))
         if score is None:
             continue
-        rationale = str(row.get("rationale") or row.get("reason") or "").strip()
-
-        index = clamp_index(row.get("index"), question_count)
-        if index is None:
-            index = position if position < question_count else None
+        index = position if positional else clamp_index(row.get("index"), question_count)
         if index is None or index in items:
-            unplaced.append((score, rationale))
             continue
+        rationale = str(row.get("rationale") or row.get("reason") or "").strip()
         items[index] = ScoredItem(index=index, score=score, rationale=rationale)
-
-    # Spill rows that could not be keyed into the first still-empty slots.
-    for score, rationale in unplaced:
-        free = next((i for i in range(question_count) if i not in items), None)
-        if free is None:
-            break
-        items[free] = ScoredItem(index=free, score=score, rationale=rationale)
 
     return [
         items.get(
@@ -193,28 +262,6 @@ def parse_scores(response_text: str, question_count: int) -> list[ScoredItem]:
         )
         for i in range(question_count)
     ]
-
-
-def clamp_index(value: object, question_count: int) -> int | None:
-    """Convert a model-reported 1-based index into a 0-based list offset.
-
-    Returns ``None`` if the value is absent or outside ``1..question_count``.
-    """
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        number = int(value)
-    elif isinstance(value, str):
-        match = re.search(r"\d+", value)
-        if not match:
-            return None
-        number = int(match.group(0))
-    else:
-        return None
-    zero_based = number - 1
-    if 0 <= zero_based < question_count:
-        return zero_based
-    return None
 
 
 def order_questions(questions: list[str], scored: list[ScoredItem]) -> list[RankedQuestion]:

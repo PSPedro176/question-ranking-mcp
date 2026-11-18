@@ -11,7 +11,14 @@ dependencies = []
 dev = [
     "ruff>=0.8.0",
     "pytest>=8",
+    # The app itself, so integration tests exercise the real FastMCP/FastAPI stack.
+    # tests/test_server.py asserts these resolve to the same versions app/uv.lock
+    # deploys, so the root lock cannot drift from what actually ships.
+    "question-ranking-mcp",
 ]
+
+[tool.uv.sources]
+question-ranking-mcp = { path = "app", editable = true }
 
 [tool.ruff]
 line-length = 100
@@ -29,10 +36,11 @@ select = [
     "RUF",  # ruff-specific
 ]
 
+[tool.ruff.lint.isort]
+known-first-party = ["server"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.pytest.ini_options]
-# Tests import `server.ranking` directly; the pure logic has no third-party deps.
-pythonpath = ["app"]
 testpaths = ["tests"]

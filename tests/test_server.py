@@ -1,0 +1,230 @@
+"""Offline integration tests: the real FastAPI + FastMCP app over HTTP.
+
+These drive ``server.app.combined_app`` through the actual streamable-HTTP MCP
+protocol, with the LLM and ``WorkspaceClient`` stubbed. No network, no
+Databricks auth. They cover the boundaries the pure ranking tests cannot see -
+which is exactly where ``best_question`` once broke without any test noticing.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import tomllib
+from concurrent.futures import ThreadPoolExecutor
+from importlib import metadata
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
+
+from server import llm, tools, utils
+from server.app import combined_app
+
+ENDPOINT = "question-ranking-router"
+MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+GOOD_RESPONSE = (
+    '[{"index": 1, "score": 2, "rationale": "too vague"},'
+    ' {"index": 2, "score": 9, "rationale": "specific and answerable"}]'
+)
+QUESTIONS = ["What about stuff?", "What drove Q3 churn in EMEA?"]
+
+
+@pytest.fixture(scope="module")
+def client():
+    """One client, one app lifespan, shared by every test in this module."""
+    with TestClient(combined_app) as test_client:
+        yield test_client
+
+
+@pytest.fixture(autouse=True)
+def _endpoint_env(monkeypatch):
+    monkeypatch.setenv("SERVING_ENDPOINT", ENDPOINT)
+
+
+@pytest.fixture
+def llm_returns(monkeypatch):
+    """Stub the 50/50 endpoint with a canned response."""
+
+    def _set(text: str):
+        monkeypatch.setattr(llm, "complete", lambda prompt, **kw: text)
+
+    return _set
+
+
+def _rpc(client, method, params=None, headers=None, rid=1):
+    """POST one JSON-RPC message to /mcp and decode the SSE-framed reply."""
+    body = {"jsonrpc": "2.0", "id": rid, "method": method}
+    if params is not None:
+        body["params"] = params
+    response = client.post("/mcp", headers={**MCP_HEADERS, **(headers or {})}, json=body)
+    assert response.status_code == 200, response.text
+    frames = [line[5:].strip() for line in response.text.splitlines() if line.startswith("data:")]
+    return json.loads(frames[-1])
+
+
+def _call_tool(client, name, arguments, headers=None):
+    reply = _rpc(client, "tools/call", {"name": name, "arguments": arguments}, headers)
+    return reply["result"]["structuredContent"]
+
+
+# --------------------------------------------------------------------------- #
+# Transport
+# --------------------------------------------------------------------------- #
+
+
+def test_initialize_then_follow_up_without_session_id(client):
+    """Stateless mode: a follow-up with NO mcp-session-id must still succeed.
+
+    Several Databricks MCP clients never send the header; a stateful server
+    would reject this second request with HTTP 400.
+    """
+    init = _rpc(
+        client,
+        "initialize",
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "pytest", "version": "0"},
+        },
+    )
+    assert init["result"]["serverInfo"]["name"] == "question-ranking-mcp"
+
+    listed = _rpc(client, "tools/list", rid=2)  # deliberately no session header
+    names = sorted(tool["name"] for tool in listed["result"]["tools"])
+    assert names == ["best_question", "rank_questions", "whoami"]
+
+
+def test_health_is_served_within_the_mcp_lifespan(client):
+    assert client.get("/health").json() == {"status": "healthy", "mcp_path": "/mcp"}
+
+
+def test_tool_functions_stay_callable_after_registration():
+    """Guards the FastMCP decorator trap directly, independent of version.
+
+    `@mcp_server.tool` replaces the function with a non-callable FunctionTool
+    on some FastMCP versions; registering must leave the module names callable.
+    """
+    assert all(callable(fn) for fn in (tools.rank_questions, tools.best_question, tools.whoami))
+
+
+# --------------------------------------------------------------------------- #
+# Ranking tools through real MCP registration
+# --------------------------------------------------------------------------- #
+
+
+def test_rank_questions_success(client, llm_returns):
+    llm_returns(GOOD_RESPONSE)
+    result = _call_tool(client, "rank_questions", {"questions": QUESTIONS})
+    assert [r["question"] for r in result["ranked"]] == [QUESTIONS[1], QUESTIONS[0]]
+    assert result["model_scored"] == 2
+    assert result["endpoint"] == ENDPOINT
+
+
+def test_best_question_success(client, llm_returns):
+    """best_question calls rank_questions internally - the call that once broke."""
+    llm_returns(GOOD_RESPONSE)
+    result = _call_tool(client, "best_question", {"questions": QUESTIONS})
+    assert result == {
+        "question": QUESTIONS[1],
+        "score": 9.0,
+        "rationale": "specific and answerable",
+        "runner_up": QUESTIONS[0],
+        "endpoint": ENDPOINT,
+    }
+
+
+def test_best_question_with_one_question_has_no_runner_up(client, llm_returns):
+    llm_returns('[{"index": 1, "score": 6, "rationale": "fine"}]')
+    assert _call_tool(client, "best_question", {"questions": ["Only?"]})["runner_up"] is None
+
+
+@pytest.mark.parametrize("tool", ["rank_questions", "best_question"])
+def test_ranking_tools_report_endpoint_failure(client, monkeypatch, tool):
+    def boom(prompt, **kw):
+        raise RuntimeError("endpoint unavailable")
+
+    monkeypatch.setattr(llm, "complete", boom)
+    result = _call_tool(client, tool, {"questions": QUESTIONS})
+    assert result["error"] == "endpoint_query_failed"
+    assert "endpoint unavailable" in result["message"]
+
+
+@pytest.mark.parametrize("tool", ["rank_questions", "best_question"])
+def test_ranking_tools_report_missing_endpoint_config(client, monkeypatch, llm_returns, tool):
+    llm_returns(GOOD_RESPONSE)
+    monkeypatch.delenv("SERVING_ENDPOINT")
+    assert _call_tool(client, tool, {"questions": QUESTIONS})["error"] == "endpoint_query_failed"
+
+
+@pytest.mark.parametrize("tool", ["rank_questions", "best_question"])
+def test_ranking_tools_reject_invalid_input(client, llm_returns, tool):
+    llm_returns(GOOD_RESPONSE)
+    assert _call_tool(client, tool, {"questions": ["   "]})["error"] == "invalid_questions"
+
+
+def test_malformed_model_numerics_return_a_structured_result(client, llm_returns):
+    """NaN/overflow once escaped as an opaque MCP error; now they fall back."""
+    llm_returns('[{"index": NaN, "score": 9}, {"index": 1e999, "score": 1e999}]')
+    result = _call_tool(client, "rank_questions", {"questions": QUESTIONS})
+    assert result["model_scored"] == 0
+    assert [r["score"] for r in result["ranked"]] == [5.0, 5.0]
+
+
+# --------------------------------------------------------------------------- #
+# On-behalf-of-user token isolation
+# --------------------------------------------------------------------------- #
+
+
+class _FakeWorkspaceClient:
+    """Stands in for WorkspaceClient; echoes back the token it was built with."""
+
+    def __init__(self, token=None, auth_type=None):
+        self.token = token
+        self.current_user = SimpleNamespace(me=self._me)
+
+    def _me(self):
+        time.sleep(0.2)  # hold the request open so the calls genuinely overlap
+        return SimpleNamespace(display_name="Test User", user_name=f"user-for-{self.token}")
+
+
+def test_overlapping_requests_each_see_only_their_own_token(client, monkeypatch):
+    monkeypatch.setenv("DATABRICKS_APP_NAME", "mcp-question-ranking")
+    monkeypatch.setattr(utils, "WorkspaceClient", _FakeWorkspaceClient)
+
+    def whoami_as(token):
+        headers = {utils.USER_TOKEN_HEADER: token} if token else {}
+        return _call_tool(client, "whoami", {}, headers=headers)["user"]
+
+    tokens = ["tok-a", "tok-b", "tok-c", "tok-d", None]
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=len(tokens)) as pool:
+        users = list(pool.map(whoami_as, tokens))
+    elapsed = time.perf_counter() - started
+
+    for token, user in zip(tokens[:-1], users[:-1], strict=True):
+        assert user["user_name"] == f"user-for-{token}"
+    assert "No user token found" in users[-1]["error"]
+    # Five 0.2 s calls would take >= 1.0 s serially; well under proves overlap.
+    assert elapsed < 0.9, f"requests did not overlap ({elapsed:.2f}s)"
+
+
+# --------------------------------------------------------------------------- #
+# Dependency drift guard
+# --------------------------------------------------------------------------- #
+
+APP_LOCK = Path(__file__).resolve().parents[1] / "app" / "uv.lock"
+
+
+@pytest.mark.parametrize(
+    "package", ["fastmcp", "mcp", "fastapi", "starlette", "uvicorn", "databricks-sdk", "pydantic"]
+)
+def test_tests_run_against_the_deployed_dependency_set(package):
+    """The deployed app installs app/uv.lock with `uv run --frozen`.
+
+    If the root dev environment resolved a different version, these tests would
+    be green against code that never ships. Fix with `uv lock` in both projects.
+    """
+    locked = {p["name"]: p["version"] for p in tomllib.loads(APP_LOCK.read_text())["package"]}
+    assert metadata.version(package) == locked[package]

@@ -7,6 +7,7 @@ No network, no Databricks auth, no framework imports: everything here exercises
 from __future__ import annotations
 
 import pytest
+
 from server.ranking import (
     FALLBACK_RATIONALE,
     FALLBACK_SCORE,
@@ -92,8 +93,11 @@ def test_clamp_score_returns_none_for_unusable(value):
     assert clamp_score(value) is None
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_clamp_score_rejects_non_finite(value):
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), float("-inf"), 10**400, "9" * 400, "1e999"]
+)
+def test_clamp_score_rejects_non_finite_and_overflow(value):
+    """Overflowing ints and strings must yield None, not raise OverflowError."""
     assert clamp_score(value) is None
 
 
@@ -106,9 +110,30 @@ def test_clamp_index_converts_one_based_to_zero_based():
     assert clamp_index(1, 3) == 0
     assert clamp_index(3, 3) == 2
     assert clamp_index("2", 3) == 1
+    assert clamp_index(" 2 ", 3) == 1
+    assert clamp_index(2.0, 3) == 1  # integral float is a genuine index
 
 
-@pytest.mark.parametrize("value", [0, 4, -1, None, True, "abc", []])
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        4,
+        -1,
+        None,
+        True,
+        "abc",
+        [],
+        "-2",  # previously matched the digit and accepted index 2
+        1.5,  # previously truncated to 1
+        "2.5",
+        "2.0",  # strings must be plain digits
+        "#2",
+        float("nan"),
+        float("inf"),
+        10**400,
+    ],
+)
 def test_clamp_index_rejects_out_of_range_or_unusable(value):
     assert clamp_index(value, 3) is None
 
@@ -163,12 +188,17 @@ def test_parse_falls_back_to_position_when_index_missing():
     assert [s.score for s in parse_scores(text, 2)] == [3.0, 8.0]
 
 
-def test_parse_spills_duplicate_index_into_free_slot():
-    text = '[{"index": 1, "score": 9}, {"index": 1, "score": 4}]'
+def test_parse_duplicate_index_keeps_first_and_never_moves_score():
+    """A repeated index belongs to the SAME question; it must not be reassigned.
+
+    This test previously asserted the opposite - that the duplicate "spilled"
+    into question 2 - which attached a score explicitly given to question 1 onto
+    question 2 and over-reported model_scored.
+    """
+    text = '[{"index": 1, "score": 9, "rationale": "A"}, {"index": 1, "score": 2}]'
     scored = parse_scores(text, 2)
-    assert scored[0].score == 9.0
-    assert scored[1].score == 4.0
-    assert all(s.matched for s in scored)
+    assert (scored[0].score, scored[0].rationale, scored[0].matched) == (9.0, "A", True)
+    assert (scored[1].score, scored[1].matched) == (FALLBACK_SCORE, False)
 
 
 def test_parse_marks_unscored_questions_as_fallback():
@@ -191,9 +221,14 @@ def test_parse_garbage_yields_all_fallbacks(text):
     assert all(s.score == FALLBACK_SCORE and s.matched is False for s in scored)
 
 
-def test_parse_ignores_extra_rows_beyond_question_count():
+def test_parse_index_less_rows_with_count_mismatch_are_discarded():
+    """Positional matching needs exactly one index-less row per question.
+
+    Three rows for two questions means the model's ordering cannot be trusted
+    to line up, so no positional guess is made.
+    """
     scored = parse_scores('[{"score": 1}, {"score": 2}, {"score": 3}]', 2)
-    assert [s.score for s in scored] == [1.0, 2.0]
+    assert all(s.matched is False for s in scored)
 
 
 def test_parse_zero_questions_returns_empty():
@@ -287,3 +322,115 @@ def test_rank_from_response_survives_unusable_output():
     assert model_scored == 0
     assert [r.score for r in ranked] == [FALLBACK_SCORE, FALLBACK_SCORE]
     assert [r.rank for r in ranked] == [1, 2]
+
+
+# --------------------------------------------------------------------------- #
+# Regressions: scores must never land on the wrong question
+# --------------------------------------------------------------------------- #
+
+
+def _by_question(ranked):
+    return {r.question: (r.score, r.rationale) for r in ranked}
+
+
+def test_regression_duplicate_index_does_not_score_another_question():
+    """Reviewer repro: B received the score and rationale that belonged to A."""
+    text = (
+        '[{"index": 1, "score": 9, "rationale": "A"},'
+        ' {"index": 1, "score": 2, "rationale": "A again"}]'
+    )
+    ranked, model_scored = rank_from_response(["A?", "B?"], text)
+    assert _by_question(ranked)["A?"] == (9.0, "A")
+    assert _by_question(ranked)["B?"] == (FALLBACK_SCORE, FALLBACK_RATIONALE)
+    assert model_scored == 1
+
+
+def test_regression_index_less_row_cannot_displace_an_explicit_index():
+    """An earlier index-less row must not push an explicitly indexed score aside."""
+    text = '[{"score": 5, "rationale": "no index"}, {"index": 1, "score": 9, "rationale": "A"}]'
+    ranked, model_scored = rank_from_response(["A?", "B?"], text)
+    assert _by_question(ranked)["A?"] == (9.0, "A")
+    assert _by_question(ranked)["B?"] == (FALLBACK_SCORE, FALLBACK_RATIONALE)
+    assert model_scored == 1
+
+
+def test_regression_invalid_index_is_not_reassigned_positionally():
+    """An out-of-range index leaves its question on fallback, not on a guess."""
+    text = '[{"index": 7, "score": 9}, {"index": 2, "score": 3}]'
+    ranked, model_scored = rank_from_response(["A?", "B?"], text)
+    assert _by_question(ranked)["A?"][0] == FALLBACK_SCORE
+    assert _by_question(ranked)["B?"][0] == 3.0
+    assert model_scored == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "text"),
+    [
+        ("NaN index", '[{"index": NaN, "score": 9}]'),  # was ValueError
+        ("overflowing index", '[{"index": 1e999, "score": 9}]'),  # was OverflowError
+        ("400-digit score", '[{"index": 1, "score": ' + "9" * 400 + "}]"),  # was OverflowError
+        ("NaN score", '[{"index": 1, "score": NaN}]'),
+        ("Infinity score", '[{"index": 1, "score": Infinity}]'),
+        ("deep nesting", "[" * 50_000),  # was RecursionError
+    ],
+)
+def test_regression_malformed_numerics_fall_back_instead_of_raising(label, text):
+    ranked, model_scored = rank_from_response(["A?", "B?"], text)
+    assert model_scored == 0, label
+    assert [r.score for r in ranked] == [FALLBACK_SCORE, FALLBACK_SCORE], label
+
+
+# --------------------------------------------------------------------------- #
+# Real-world response shapes
+# --------------------------------------------------------------------------- #
+
+
+def test_truncated_multi_row_json_salvages_complete_rows():
+    """The model hit max_tokens mid-array: keep the rows that did complete."""
+    text = '[{"index": 1, "score": 9, "rationale": "a"}, {"index": 2, "score": 4}, {"index": 3, "sc'
+    ranked, model_scored = rank_from_response(["A?", "B?", "C?"], text)
+    assert model_scored == 2
+    assert _by_question(ranked)["A?"][0] == 9.0
+    assert _by_question(ranked)["B?"][0] == 4.0
+    assert _by_question(ranked)["C?"][0] == FALLBACK_SCORE
+
+
+def test_truncated_wrapped_object_salvages_complete_rows():
+    text = '{"questions": [{"index": 1, "score": 8}, {"index": 2, "score": 2}, {"ind'
+    ranked, model_scored = rank_from_response(["A?", "B?", "C?"], text)
+    assert model_scored == 2
+    scores = _by_question(ranked)
+    assert (scores["A?"][0], scores["B?"][0], scores["C?"][0]) == (8.0, 2.0, FALLBACK_SCORE)
+
+
+def test_row_with_a_list_field_is_not_mistaken_for_a_wrapper():
+    text = '[{"index": 1, "score": 7, "items": ["x"]}]'
+    assert parse_scores(text, 1)[0].score == 7.0
+
+
+def test_duplicate_question_text_keeps_each_score_with_its_own_index():
+    text = (
+        '[{"index": 1, "score": 9, "rationale": "first copy"},'
+        ' {"index": 2, "score": 2, "rationale": "second copy"}]'
+    )
+    ranked, _ = rank_from_response(["Same?", "Same?"], text)
+    assert [(r.question, r.score, r.rationale) for r in ranked] == [
+        ("Same?", 9.0, "first copy"),
+        ("Same?", 2.0, "second copy"),
+    ]
+
+
+def test_unicode_and_portuguese_text_is_preserved_end_to_end():
+    questions = ["Qual é o impacto da inflação?", "Por que a evasão subiu em São Paulo? 📈"]
+    prompt = build_prompt(questions, context="Relatório trimestral — região Sul")
+    assert all(q in prompt for q in questions)
+    assert "Relatório trimestral — região Sul" in prompt
+
+    text = (
+        '[{"index": 1, "score": 4, "rationale": "genérica demais"},'
+        ' {"index": 2, "score": 9, "rationale": "específica e respondível"}]'
+    )
+    ranked, _ = rank_from_response(questions, text)
+    assert ranked[0].question == "Por que a evasão subiu em São Paulo? 📈"
+    assert ranked[0].rationale == "específica e respondível"
+    assert ranked[1].rationale == "genérica demais"

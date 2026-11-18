@@ -8,9 +8,10 @@ resources:
       name: ${var.app_name}
       description: MCP server exposing question-ranking tools over streamable HTTP at /mcp.
 
-      # `databricks bundle deploy` creates an app but leaves it stopped by default, which
-      # would mean no running MCP server until someone also ran `databricks apps start`.
-      # `started: true` makes deploy bring it up, keeping the one-command contract.
+      # Without this, `databricks bundle deploy` creates the app but leaves it stopped.
+      # `started: true` makes the first deploy start it and create its initial deployment.
+      # A later deploy that only changes app code does NOT redeploy it, so always follow
+      # `bundle deploy` with `bundle run question_ranking_mcp` - see the README.
       lifecycle:
         started: true
 
@@ -27,7 +28,7 @@ resources:
       # intentional: DABs uses snake_case `value_from` here, while app/app.yaml uses
       # camelCase `valueFrom`.
       config:
-        command: ["uv", "run", "question-ranking-mcp"]
+        command: ["uv", "run", "--frozen", "question-ranking-mcp"]
         env:
           - name: SERVING_ENDPOINT
             value_from: ranking-endpoint

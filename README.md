@@ -44,7 +44,8 @@ MCP client (AI Playground, Claude Code, Cursor, agent)
 | `app/` | App source, including its own `app.yaml` |
 | `app/server/ranking.py` | All ranking logic — pure, no I/O, fully unit-tested |
 | `jobs/register_uc_mcp.py` | Idempotent UC connection + MCP service registration |
-| `tests/` | 66 unit tests, no network and no Databricks auth |
+| `app/uv.lock` | The exact dependency set the app deploys with (`uv run --frozen`) |
+| `tests/` | 112 tests (pure logic + real-protocol integration), no network or auth |
 
 ## The tools
 
@@ -120,23 +121,34 @@ which **does not exist yet**. Create it, then grant exactly:
 | Catalog `prod_ai` | `USE CATALOG`, `CREATE SCHEMA` | To create the `question-ranking-mcp` schema |
 | Both served models | `USE CATALOG` + `USE SCHEMA` on `system.ai`, `EXECUTE` on each model | To serve them from the endpoint |
 
-```sql
-GRANT USE CATALOG, CREATE SCHEMA ON CATALOG prod_ai TO `agents-deploy`;
+**Unity Catalog SQL identifies a service principal by its application ID, not its
+display name.** ``TO `agents-deploy` `` would not grant the service principal — it would
+look for a user or group of that name. Look the ID up first:
 
-GRANT USE CATALOG ON CATALOG system TO `agents-deploy`;
-GRANT USE SCHEMA  ON SCHEMA  system.ai TO `agents-deploy`;
-GRANT EXECUTE ON MODEL system.ai.llama_v3_2_3b_instruct  TO `agents-deploy`;
-GRANT EXECUTE ON MODEL system.ai.mistral_7b_instruct_v0_2 TO `agents-deploy`;
+```bash
+databricks service-principals list --filter 'displayName eq "agents-deploy"' \
+  --profile <prod-profile> | jq -r '.[].applicationId'
+```
+
+Then substitute it for `<agents-deploy-application-id>` below:
+
+```sql
+GRANT USE CATALOG, CREATE SCHEMA ON CATALOG prod_ai TO `<agents-deploy-application-id>`;
+
+GRANT USE CATALOG ON CATALOG system TO `<agents-deploy-application-id>`;
+GRANT USE SCHEMA  ON SCHEMA  system.ai TO `<agents-deploy-application-id>`;
+GRANT EXECUTE ON MODEL system.ai.llama_v3_2_3b_instruct  TO `<agents-deploy-application-id>`;
+GRANT EXECUTE ON MODEL system.ai.mistral_7b_instruct_v0_2 TO `<agents-deploy-application-id>`;
 ```
 
 Only if you also opt into UC MCP registration (see below):
 
 ```sql
 GRANT CREATE CONNECTION, CREATE SERVICE, USE SCHEMA
-  ON SCHEMA prod_ai.`question-ranking-mcp` TO `agents-deploy`;
+  ON SCHEMA prod_ai.`question-ranking-mcp` TO `<agents-deploy-application-id>`;
 
 -- Only if you also pass a bearer token via mcp_bearer_token_secret:
-GRANT READ_SECRET ON SECRET <catalog>.<schema>.<secret> TO `agents-deploy`;
+GRANT READ_SECRET ON SECRET <catalog>.<schema>.<secret> TO `<agents-deploy-application-id>`;
 ```
 
 Note the backticks. Hyphens are legal in a UC schema name, and the bundle YAML takes the
@@ -156,14 +168,41 @@ literal `question-ranking-mcp`, but **SQL requires backtick-quoting**:
 databricks bundle validate -t dev  --profile <your-profile>
 databricks bundle validate -t prod --profile <prod-profile>
 
-# Deploy. One command: `lifecycle.started: true` on the app means deploy also starts it,
-# so no separate `databricks apps start` is needed.
-databricks bundle deploy -t dev  --profile <your-profile>
+# Deploy the bundle, then deploy and start the app's code.
 databricks bundle deploy -t prod --profile <prod-profile>
+databricks bundle run question_ranking_mcp -t prod --profile <prod-profile>
+
+# The same for dev.
+databricks bundle deploy -t dev --profile <your-profile>
+databricks bundle run question_ranking_mcp -t dev --profile <your-profile>
 
 # Find the app URL.
 databricks apps get mcp-question-ranking --profile <prod-profile> | jq -r .url
 ```
+
+**Always follow `bundle deploy` with `bundle run question_ranking_mcp`** — that runs the
+app resource by its bundle key. `bundle deploy` uploads the source but does not reliably
+ship it to the app:
+
+- On a **fresh install**, `lifecycle.started: true` makes `bundle deploy` start the app and
+  create its first deployment from the synced source.
+- On a **later deploy that only changes app code**, `bundle deploy` uploads the new files
+  but does not redeploy the app. The CLI only re-runs the app's lifecycle step when an app
+  *config* field changes, so the app keeps serving the previous code.
+
+`bundle run` on an app starts its compute if stopped and then always creates a new
+deployment from the bundle's synced source. Do not use `databricks apps start` for this: it
+starts compute and resumes the *last* deployment, so it can bring stale code back up.
+
+### Choosing a workspace
+
+`dev` has **no pinned host**: it deploys to whichever workspace `--profile` selects, so
+any developer can use it with their own profile.
+
+`prod` is **pinned** to `https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com`.
+The CLI **rejects** a `--profile` whose host differs from a target's explicit
+`workspace.host` — a profile cannot redirect `prod`. To deploy `prod` elsewhere, change
+`targets.prod.workspace.host` in `databricks.yml`.
 
 ### App names in `dev`
 
@@ -179,10 +218,14 @@ That leaves 20 characters for the suffix. If your sanitised username is longer, 
 
 ```bash
 databricks bundle deploy -t dev --profile <your-profile> --var dev_app_suffix=<short>
+databricks bundle run question_ranking_mcp -t dev --profile <your-profile> --var dev_app_suffix=<short>
 
 # or replace the whole name, which takes precedence:
 databricks bundle deploy -t dev --profile <your-profile> --var app_name=mcp-<something>
 ```
+
+Pass the **same** `--var` to `bundle run`. It resolves the app name from the same
+variable, so omitting it would target a different app.
 
 The endpoint provisions GPU capacity and can take several minutes to go green:
 
@@ -191,10 +234,6 @@ databricks serving-endpoints get question-ranking-router --profile <prod-profile
   | jq '{ready: .state.ready, config_update: .state.config_update}'
 # usable once ready == READY and config_update == NOT_UPDATING
 ```
-
-`dev` targets `https://fevm-perdomo-demos.cloud.databricks.com` and `prod` targets
-`https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com`. Override with
-`--var`-free profile selection or edit the target's `workspace.host`.
 
 ## Connect an MCP client
 
@@ -208,28 +247,73 @@ https://<app-url>/mcp
 Playground and the Assistant among them) do not send an `mcp-session-id` header, and a
 stateful server rejects their follow-up requests with HTTP 400.
 
-For Claude Code, Cursor, and similar:
+In the **AI Playground**, the app appears in the MCP server picker — this is why the app
+name carries the `mcp-` prefix, which the Playground uses to recognise it. The Playground
+authenticates you itself.
+
+### Authenticating an external client
+
+The endpoint is protected: every request needs a Databricks **OAuth** access token in the
+`Authorization` header. **Personal access tokens are not supported** for MCP callers.
+
+**1. Get access to the app.** The caller needs the **CAN USE** permission on the app. The
+deploying identity already has CAN MANAGE; grant everyone else explicitly:
+
+```bash
+databricks apps update-permissions mcp-question-ranking --profile <prod-profile> --json '{
+  "access_control_list": [{"user_name": "someone@example.com", "permission_level": "CAN_USE"}]
+}'
+```
+
+**2. Sign in once with OAuth (U2M).** This opens a browser and caches a refresh token:
+
+```bash
+databricks auth login --host https://<workspace-host> --profile mcp-user
+```
+
+**3. Get an access token and check it works.** A CLI-issued token carries the `all-apis`
+scope, which covers the app's user authorization scopes:
+
+```bash
+export DATABRICKS_TOKEN=$(databricks auth token --profile mcp-user | jq -r .access_token)
+
+curl -s https://<app-url>/mcp \
+  -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}'
+```
+
+A successful reply names you under `user`, which confirms both the token and the
+on-behalf-of-user forwarding.
+
+**4. Configure your client** to send the same header. For Claude Code (`.mcp.json`, which
+expands `${VAR}` from the environment):
 
 ```json
 {
   "mcpServers": {
     "question-ranking": {
       "type": "http",
-      "url": "https://<app-url>/mcp"
+      "url": "https://<app-url>/mcp",
+      "headers": { "Authorization": "Bearer ${DATABRICKS_TOKEN}" }
     }
   }
 }
 ```
 
-In the **AI Playground**, the app appears in the MCP server picker — this is why the app
-name carries the `mcp-` prefix, which the Playground uses to recognise it.
+**Tokens expire after about an hour** — the `expiry` field in the `databricks auth token`
+output gives the exact time. The header above is fixed when the client starts, so on
+expiry re-run step 3 (the CLI refreshes the token silently from the cached refresh token)
+and restart the client. Re-run step 2 only if the refresh token itself has lapsed.
 
-**Authentication: MCP callers must use OAuth.** Personal access tokens are not supported
-for MCP requests to Databricks Apps. The app declares the `iam.current-user:read` user API
-scope so Apps forwards the caller's token in `x-forwarded-access-token`, which the
-`whoami` tool reads. The `rank_questions` and `best_question` tools instead call the
-serving endpoint as the app's *own* service principal, so ranking works for any authorised
-caller without each user needing endpoint access.
+### Which identity does what
+
+The app declares the `iam.current-user:read` user API scope, so Apps forwards the caller's
+token in `x-forwarded-access-token`; the `whoami` tool reads it. The `rank_questions` and
+`best_question` tools instead call the serving endpoint as the app's *own* service
+principal, so ranking works for any caller with CAN USE, without each user needing access
+to the endpoint.
 
 ## Unity Catalog registration
 
@@ -249,9 +333,8 @@ Databricks' own documentation
 It also notes that **SQL commands such as `CREATE MCP SERVICE` aren't supported**, and
 that **UC Global Search does not surface MCPs** — find them on the MCPs page.
 
-An Apps-hosted MCP server is exactly the source that is excluded. There is a concrete
-mechanical reason: a UC HTTP connection requires a `bearer_token` option, while a
-Databricks Apps MCP endpoint requires OAuth and rejects static bearer tokens.
+An Apps-hosted MCP server is exactly the source that is excluded. Databricks does not
+document *why*, and this README does not guess.
 
 **The supported consumption path is connecting your MCP client directly to
 `https://<app-url>/mcp`**, as described above. That path works today and needs no UC
@@ -324,11 +407,28 @@ uv run ruff format --check .
 uv run pytest -q
 ```
 
-Tests cover `app/server/ranking.py` only, and that is intentional: all ranking decisions
-(input validation, score coercion and clamping, JSON extraction, index-keyed matching,
-fallbacks, ordering, tie-breaking, prompt construction) live there with no network,
-framework, or Databricks dependency. The I/O layers (`llm.py`, `tools.py`, `app.py`) hold
-no decision logic worth mocking a workspace for.
+There are two test files, and neither needs network access or Databricks auth:
+
+- **`tests/test_ranking.py`** tests the pure logic in `app/server/ranking.py`: input
+  validation, score and index coercion, JSON extraction and salvage, the index policy that
+  keeps every score on the question it was given for, fallbacks, ordering, and prompt
+  construction.
+- **`tests/test_server.py`** drives the real FastAPI + FastMCP app over the
+  streamable-HTTP MCP protocol, with the LLM and `WorkspaceClient` stubbed. It covers MCP
+  initialization followed by a request with no session id, `/health` inside the same
+  lifespan, both ranking tools on success and on failure, and overlapping requests that
+  carry distinct forwarded tokens. These boundaries are where bugs hide that the pure
+  tests cannot see: `best_question` once broke on a FastMCP version that turned decorated
+  tools into non-callable objects, and no pure test noticed.
+
+The deployed app runs `uv run --frozen` against `app/uv.lock`. A drift test fails if the
+dev environment resolves different versions of the key packages, so the tests always run
+against the dependency set that actually ships. After changing dependencies, refresh both
+locks:
+
+```bash
+uv lock --project app && uv lock && uv sync
+```
 
 Run the server locally:
 

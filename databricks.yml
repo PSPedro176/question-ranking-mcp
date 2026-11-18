@@ -98,18 +98,17 @@ variables:
       "<catalog>.<schema>.<secret>", holding the bearer token for the UC HTTP connection.
       This is a UC Secret, NOT a workspace secret scope: a "<scope>/<key>" path is a
       different namespace and the job rejects it with an explicit error. `bearer_token` is a
-      required HTTP-connection option, but Databricks Apps MCP endpoints require OAuth and
-      reject static bearer tokens - see the README's Unity Catalog registration section.
+      required option for a bearer-token UC HTTP connection - see the README's Unity
+      Catalog registration section.
     default: ""
 
 targets:
-  # Validated against the authenticated `perdomo` workspace. Host is overridable so this
-  # target works from any profile: `databricks bundle validate -t dev --profile <name>`.
+  # No `workspace.host` on purpose: dev deploys to whichever workspace `--profile` selects.
+  # The CLI rejects a profile whose host differs from an explicit `workspace.host`, so
+  # pinning one here would tie dev to a single workspace.
   dev:
     mode: development
     default: true
-    workspace:
-      host: https://fevm-perdomo-demos.cloud.databricks.com
     variables:
       # `mode: development` prefixes most resource names automatically but NOT app names,
       # because app names have a restricted charset. Suffix it manually so two developers
@@ -122,8 +121,8 @@ targets:
       # illegal, while domain_friendly_name is hyphen-sanitised (`pedro-perdomo`).
       app_name: mcp-qrank-${var.dev_app_suffix}
 
-  # The real deploy target. Nobody has a local profile for this host yet, so `prod` cannot
-  # be validated or deployed until the `agents-deploy` service principal exists.
+  # The real deploy target, pinned to one host. A `--profile` for a different host is
+  # rejected by the CLI; to retarget prod, change `workspace.host` here.
   prod:
     mode: production
     workspace:

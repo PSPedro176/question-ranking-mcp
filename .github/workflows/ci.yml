@@ -15,7 +15,11 @@ jobs:
         with:
           enable-cache: true
 
-      - run: uv sync
+      # Fail if either lockfile is stale relative to its pyproject. app/uv.lock is what
+      # the deployed app installs (`uv run --frozen`), so it must never silently drift.
+      - run: uv lock --check
+      - run: uv lock --check --project app
+      - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pytest -q

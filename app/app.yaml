@@ -1,7 +1,9 @@
 # Databricks Apps runtime config.
 # NOTE: this file uses camelCase `valueFrom`. The DABs equivalent in
 # resources/app.yml uses snake_case `value_from`. Both are real and different.
-command: ["uv", "run", "question-ranking-mcp"]
+# `--frozen` installs exactly what app/uv.lock pins and never re-resolves, so the
+# deployed dependency set is the one the tests ran against.
+command: ["uv", "run", "--frozen", "question-ranking-mcp"]
 
 env:
   # Resolved from the app's `ranking-endpoint` serving_endpoint resource,

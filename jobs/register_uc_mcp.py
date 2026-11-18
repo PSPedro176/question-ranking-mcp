@@ -166,9 +166,8 @@ if BEARER_TOKEN_SECRET:
 else:
     print(
         "WARNING: no bearer_token_secret supplied. 'bearer_token' is a required option for "
-        "a UC HTTP connection, so creation will likely fail. Databricks Apps MCP endpoints "
-        "require OAuth and do not accept static bearer tokens or PATs, which is the "
-        "underlying reason Apps-hosted MCP registration is unsupported."
+        "a UC HTTP connection that uses bearer-token authentication, so creation will "
+        "likely fail. Pass a Unity Catalog Secret as bearer_token_secret."
     )
 
 try:
