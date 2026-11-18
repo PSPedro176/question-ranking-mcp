@@ -1,0 +1,26 @@
+# Dev tooling only (ruff + pytest). The deployable app lives in app/ (see app/requirements.txt).
+[project]
+name = "hello-mcp-dev"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff>=0.8.0", "pytest>=8", "pytest-asyncio>=0.24", "fastmcp>=4.2,<5", "uvicorn>=0.54,<1", "httpx"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".databricks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["hello_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["app"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
