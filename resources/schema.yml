@@ -4,3 +4,4 @@ resources:
       catalog_name: ${var.catalog}
       name: ${var.schema}
       comment: Hello-world MCP server registered in Unity Catalog (UC HTTP connection + MCP service).
+      grants: ${var.schema_grants}

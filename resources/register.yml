@@ -19,7 +19,7 @@ resources:
           spec:
             environment_version: "3"
             dependencies:
-              - databricks-sdk>=0.167
+              - databricks-sdk==0.168.0
       tasks:
         - task_key: create_connection
           environment_key: default
@@ -53,7 +53,4 @@ resources:
       lifecycle:
         depends_on:
           - resource: job_runs.create_connection_run
-      grants:
-        - principal: ${var.mcp_consumers}
-          privileges:
-            - EXECUTE
+      grants: ${var.mcp_service_grants}

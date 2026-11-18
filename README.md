@@ -20,16 +20,19 @@ no bundle resource type, so `jobs/create_connection.py` creates it during `bundl
 
 ## Deploy
 
+`PROFILE` (a Databricks CLI profile) is required; the Makefile refuses to run without it.
+
 ```bash
-make deploy PROFILE=accelerate-gateway   # bundle deploy + bundle run hello_app (ships app code)
-make smoke  PROFILE=accelerate-gateway   # initialize / tools/list / tools/call through the UC gateway
-make test lint                           # pytest + ruff (uses uv)
+make deploy PROFILE=<profile>    # bundle deploy + bundle run hello_app (ships app code)
+make smoke  PROFILE=<profile>    # initialize / tools/list / tools/call through the UC gateway
+make test lint                   # pytest + ruff (uses uv)
+make destroy PROFILE=<profile>   # bundle destroy, then deletes the UC connection (idempotent)
 ```
 
-`catalog` (default `dev_ai`) and `schema` (default `hello_mcp`) are bundle variables, e.g.
-`databricks bundle deploy -t dev --var schema=my_schema`. The `dev` target is pinned to
+`CATALOG` (default `dev_ai`), `SCHEMA` (`hello_mcp`), `SERVICE` (`hello`) and `CONNECTION`
+(`hello_mcp_conn`) are passed to every bundle command and to the smoke test, e.g.
+`make deploy PROFILE=p SCHEMA=my_schema`. The `dev` target is pinned to
 `https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com`. Re-running `make deploy` is safe.
-Use `make deploy FQN=...` / `make smoke FQN=<catalog>.<schema>.hello` when overriding variables.
 
 ## Referencing the MCP in the Unity Gateway coding-agent config
 
@@ -38,17 +41,26 @@ This repo does not touch that config. Add the UC name and/or gateway URL:
 - names: `["dev_ai.hello_mcp.hello"]` (`<catalog>.<schema>.<service>`)
 - URL: `https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com/ai-gateway/mcp-services/dev_ai.hello_mcp.hello`
 
-Callers need `EXECUTE` on the MCP service (granted to `account users` via `var.mcp_consumers`),
-plus `USE CATALOG`/`USE SCHEMA`.
+## Access
+
+Only the owner (the deploying identity) can use the MCP by default. To share it, set both
+grant lists under `targets.<target>.variables` in `databricks.yml` (complex variables cannot be
+passed with `--var`; a commented example is there): `mcp_service_grants` (`EXECUTE`) and
+`schema_grants` (`USE_SCHEMA`). `USE CATALOG` on the catalog is **not** managed by this bundle
+(the catalog pre-exists), so those principals must already hold it.
 
 ## Notes and caveats
 
-- **Auth identity.** The job mints one OAuth secret for the app's service principal and passes it
-  straight to the connection; it is never logged, committed or stored elsewhere. The secret
-  expires after 2 years. To rotate, delete the connection (`databricks connections delete
-  dev_ai.hello_mcp.hello_mcp_conn`) and run `make deploy` (not exercised; UC may require removing the MCP service first, e.g. with `bundle destroy`).
-- If the app is deleted and recreated, its service principal changes: the connection must be recreated
-  the same way.
+- **Auth identity.** The job mints an OAuth secret for the app's service principal only when
+  the connection is missing or stale (host, base path, client id or token endpoint differ from the
+  app as it is now), and passes it straight to the connection. It is revoked if creating or
+  updating the connection fails, and never logged. Re-deploys with nothing stale mint nothing. A
+  stale connection (for example after the app was recreated, which changes its service principal)
+  is repaired in place with `connections.update`; this works while the MCP service references it.
+  Secrets expire after 2 years; to rotate, delete the connection and redeploy. Old secrets of a
+  replaced service principal cannot be revoked by the job (their ids are unknown).
+- `make destroy` runs `bundle destroy` and then deletes the connection (created outside the
+  bundle). The destroy path has not been exercised against the live demo stack.
 - The bundle does not use `mode: development` so the schema keeps its exact name.
 - `app/requirements.txt` (pip) is used rather than a `uv.lock`: a lock created on a machine with
   an internal PyPI proxy embeds proxy URLs the Apps build cannot reach.

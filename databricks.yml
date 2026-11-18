@@ -25,9 +25,19 @@ variables:
   connection_name:
     description: Name of the schema-level UC HTTP connection backing the MCP service.
     default: hello_mcp_conn
-  mcp_consumers:
-    description: UC principal granted EXECUTE on the MCP service.
-    default: account users
+  # Grants are explicit and empty by default: only the owner (the deployer) can use the MCP.
+  # Complex variables cannot be set with --var or BUNDLE_VAR_*, so to let others use it
+  # override both lists under `targets.<target>.variables` (see the commented example below).
+  # They are separate lists because bundle variables cannot be mapped. USE CATALOG on the
+  # catalog is NOT managed by this bundle (the catalog pre-exists); the principals need it too.
+  mcp_service_grants:
+    description: "Grants on the MCP service, a list of {principal, privileges: [EXECUTE]}."
+    type: complex
+    default: []
+  schema_grants:
+    description: "Grants on the schema, a list of {principal, privileges: [USE_SCHEMA]}."
+    type: complex
+    default: []
 
 targets:
   # No `mode: development`: it would prefix the schema and rename resources, but the
@@ -36,3 +46,8 @@ targets:
     default: true
     workspace:
       host: https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com
+    # variables:
+    #   mcp_service_grants:
+    #     - {principal: my-group, privileges: [EXECUTE]}
+    #   schema_grants:
+    #     - {principal: my-group, privileges: [USE_SCHEMA]}
