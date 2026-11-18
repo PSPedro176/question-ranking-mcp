@@ -1,17 +1,23 @@
-# Required: PROFILE=<databricks CLI profile>. Optional: CATALOG, SCHEMA, SERVICE, CONNECTION,
-# APP, TARGET.
+# Convenience wrapper around the plain `databricks bundle ...` commands in the README.
+# Required: PROFILE=<databricks CLI profile>. TARGET (dev|prod, default dev) selects the bundle
+# target, whose variables are the source of truth. CATALOG, SCHEMA, SERVICE, CONNECTION and APP
+# are optional explicit overrides, passed through as --var.
 PROFILE ?=
 TARGET  ?= dev
-CATALOG ?= dev_ai
-SCHEMA  ?= hello_mcp
-SERVICE ?= hello
-CONNECTION ?= hello_mcp_conn
-APP     ?= mcp-hello
+CATALOG ?=
+SCHEMA  ?=
+SERVICE ?=
+CONNECTION ?=
+APP     ?=
 
-FQN  = $(CATALOG).$(SCHEMA).$(SERVICE)
-VARS = --var catalog=$(CATALOG) --var schema=$(SCHEMA) --var mcp_service_id=$(SERVICE) \
-       --var connection_name=$(CONNECTION) --var app_name=$(APP)
+VARS = $(if $(CATALOG),--var catalog=$(CATALOG)) $(if $(SCHEMA),--var schema=$(SCHEMA)) \
+       $(if $(SERVICE),--var mcp_service_id=$(SERVICE)) \
+       $(if $(CONNECTION),--var connection_name=$(CONNECTION)) $(if $(APP),--var app_name=$(APP))
 DBX  = databricks --profile $(PROFILE)
+
+# Resolved variable values of the target (with overrides applied); evaluated once, on first use.
+RESOLVED = $(eval RESOLVED := $(shell $(DBX) bundle validate -t $(TARGET) $(VARS) -o json 2>/dev/null | python3 -c "import sys,json;v=json.load(sys.stdin)['variables'];print(*(k+'='+v[k]['value'] for k in ('catalog','schema','mcp_service_id','connection_name')))"))$(RESOLVED)
+rv = $(patsubst $(1)=%,%,$(filter $(1)=%,$(RESOLVED)))
 
 .PHONY: validate deploy smoke test lint destroy check-profile
 
@@ -28,7 +34,8 @@ deploy: check-profile
 	$(DBX) bundle run hello_app -t $(TARGET) $(VARS)
 
 smoke: check-profile
-	uv run python scripts/smoke_test.py --profile $(PROFILE) --name $(FQN)
+	uv run python scripts/smoke_test.py --profile $(PROFILE) \
+		--name $(call rv,catalog).$(call rv,schema).$(call rv,mcp_service_id)
 
 test:
 	uv run pytest -q
@@ -40,6 +47,7 @@ lint:
 # cannot be dropped, so: delete the MCP service, then the connection (only a confirmed
 # NOT_FOUND is ignored), then let the bundle remove everything else.
 destroy: check-profile
-	uv run python scripts/teardown.py --profile $(PROFILE) --catalog $(CATALOG) \
-		--schema $(SCHEMA) --service $(SERVICE) --connection $(CONNECTION)
+	uv run python scripts/teardown.py --profile $(PROFILE) --catalog $(call rv,catalog) \
+		--schema $(call rv,schema) --service $(call rv,mcp_service_id) \
+		--connection $(call rv,connection_name)
 	$(DBX) bundle destroy -t $(TARGET) $(VARS) --auto-approve

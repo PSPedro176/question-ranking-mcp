@@ -40,14 +40,30 @@ variables:
     default: []
 
 targets:
-  # No `mode: development`: it would prefix the schema and rename resources, but the
-  # stack must live at exactly dev_ai.hello_mcp.hello so it can be referenced by name.
+  # Both targets deploy to the same workspace; they differ only in catalog and app name.
+  # No `mode: development`: it would prefix the schema and rename resources, but the stack
+  # must live at exactly <catalog>.hello_mcp.hello so it can be referenced by name.
+  # Bundle state is per target (default root_path ~/.bundle/<bundle>/<target>), so the two
+  # targets do not share state. App names are workspace-global, hence the different names.
   dev:
     default: true
     workspace:
       host: https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com
-    # variables:
-    #   mcp_service_grants:
-    #     - {principal: my-group, privileges: [EXECUTE]}
-    #   schema_grants:
-    #     - {principal: my-group, privileges: [USE_SCHEMA]}
+    variables:
+      catalog: dev_ai
+      app_name: mcp-hello
+      # mcp_service_grants:
+      #   - {principal: my-group, privileges: [EXECUTE]}
+      # schema_grants:
+      #   - {principal: my-group, privileges: [USE_SCHEMA]}
+
+  prod:
+    workspace:
+      host: https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com
+    variables:
+      catalog: prod_ai
+      app_name: mcp-hello-prod
+      # mcp_service_grants:
+      #   - {principal: my-group, privileges: [EXECUTE]}
+      # schema_grants:
+      #   - {principal: my-group, privileges: [USE_SCHEMA]}
