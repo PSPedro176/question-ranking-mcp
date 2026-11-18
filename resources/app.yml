@@ -8,10 +8,10 @@ resources:
       name: ${var.app_name}
       description: MCP server exposing question-ranking tools over streamable HTTP at /mcp.
 
-      # Without this, `databricks bundle deploy` creates the app but leaves it stopped.
-      # `started: true` makes the first deploy start it and create its initial deployment.
-      # A later deploy that only changes app code does NOT redeploy it, so always follow
-      # `bundle deploy` with `bundle run question_ranking_mcp` - see the README.
+      # Keeps the app's compute running; without it `bundle deploy` leaves the app stopped.
+      # It does not reliably ship code: `bundle deploy` does not redeploy the app when only
+      # its code changed. So EVERY deploy is two steps - `bundle deploy`, then
+      # `bundle run question_ranking_mcp`, which ships the synced source. See the README.
       lifecycle:
         started: true
 

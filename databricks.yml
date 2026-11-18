@@ -103,12 +103,14 @@ variables:
     default: ""
 
 targets:
-  # No `workspace.host` on purpose: dev deploys to whichever workspace `--profile` selects.
-  # The CLI rejects a profile whose host differs from an explicit `workspace.host`, so
-  # pinning one here would tie dev to a single workspace.
+  # Pinned on purpose. The CLI rejects a `--profile` whose host differs from an explicit
+  # `workspace.host`, so pinning is what stops `-t dev` from ever deploying into the
+  # production sandbox. To use another dev workspace, change the host here.
   dev:
     mode: development
     default: true
+    workspace:
+      host: https://fevm-perdomo-demos.cloud.databricks.com
     variables:
       # `mode: development` prefixes most resource names automatically but NOT app names,
       # because app names have a restricted charset. Suffix it manually so two developers

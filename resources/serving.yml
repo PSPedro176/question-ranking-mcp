@@ -16,13 +16,10 @@ resources:
         Routes question-ranking prompts 50/50 across two open-source models so the MCP
         server's scores are not tied to a single model's bias.
 
-      # The app's `serving_endpoint` resource block (resources/app.yml) is what actually
-      # grants the app's runtime service principal CAN_QUERY. Restating it here makes the
-      # grant explicit and keeps it intact if a target ever gains a top-level `permissions`
-      # block, which would otherwise overwrite this endpoint's ACL on deploy.
-      permissions:
-        - level: CAN_QUERY
-          service_principal_name: ${resources.apps.question_ranking_mcp.service_principal_client_id}
+      # No `permissions` block: the app's `serving_endpoint` resource (resources/app.yml)
+      # grants the app's runtime service principal CAN_QUERY. Do not add one here, or a
+      # top-level one in databricks.yml, without also listing that principal: a bundle-set
+      # ACL replaces the endpoint's ACL on deploy and would strip the app's grant.
 
       config:
         served_entities:

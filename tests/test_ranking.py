@@ -364,6 +364,41 @@ def test_regression_invalid_index_is_not_reassigned_positionally():
 
 
 @pytest.mark.parametrize(
+    ("label", "text", "expected_scores", "expected_model_scored"),
+    [
+        # (a) Every row states `"index": null` - an invalid index, not an absent one.
+        (
+            "all rows null-index",
+            '[{"index": null, "score": 9}, {"index": null, "score": 2}]',
+            {"A?": FALLBACK_SCORE, "B?": FALLBACK_SCORE},
+            0,
+        ),
+        # (b) The null row is discarded; the valid row keeps its own question.
+        (
+            "one null, one valid",
+            '[{"index": null, "score": 9}, {"index": 2, "score": 2}]',
+            {"A?": FALLBACK_SCORE, "B?": 2.0},
+            1,
+        ),
+        # (c) A present `index` key on ANY row disables positional matching.
+        (
+            "missing-key and null-key rows mixed",
+            '[{"score": 9}, {"index": null, "score": 2}]',
+            {"A?": FALLBACK_SCORE, "B?": FALLBACK_SCORE},
+            0,
+        ),
+    ],
+)
+def test_regression_null_index_is_never_matched_by_position(
+    label, text, expected_scores, expected_model_scored
+):
+    """`{"index": null}` was once treated as index-less and placed by position."""
+    ranked, model_scored = rank_from_response(["A?", "B?"], text)
+    assert {q: score for q, (score, _) in _by_question(ranked).items()} == expected_scores, label
+    assert model_scored == expected_model_scored, label
+
+
+@pytest.mark.parametrize(
     ("label", "text"),
     [
         ("NaN index", '[{"index": NaN, "score": 9}]'),  # was ValueError

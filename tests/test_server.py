@@ -9,7 +9,7 @@ which is exactly where ``best_question`` once broke without any test noticing.
 from __future__ import annotations
 
 import json
-import time
+import threading
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from importlib import metadata
@@ -182,32 +182,45 @@ class _FakeWorkspaceClient:
 
     def __init__(self, token=None, auth_type=None):
         self.token = token
-        self.current_user = SimpleNamespace(me=self._me)
-
-    def _me(self):
-        time.sleep(0.2)  # hold the request open so the calls genuinely overlap
-        return SimpleNamespace(display_name="Test User", user_name=f"user-for-{self.token}")
+        self.current_user = SimpleNamespace(
+            me=lambda: SimpleNamespace(display_name="Test User", user_name=f"user-for-{token}")
+        )
 
 
-def test_overlapping_requests_each_see_only_their_own_token(client, monkeypatch):
+def test_concurrent_requests_each_see_only_their_own_token(client, monkeypatch):
+    """Token isolation under real concurrency, with no wall-clock assertion.
+
+    A barrier sits between "middleware stored this request's headers" and "tool
+    reads the token". It only releases once EVERY request is parked there, so all
+    of them have stored their headers before any of them reads one. If header
+    storage leaked across requests, they would all read the last writer's token.
+    The barrier timeout is a deadlock guard only; if requests cannot run
+    concurrently it breaks, and the test fails on the error, not on timing.
+    """
+    tokens = ["tok-a", "tok-b", "tok-c", "tok-d", None]  # None: no forwarded token
+    barrier = threading.Barrier(len(tokens), timeout=30)
+    read_token = utils.get_user_authenticated_workspace_client
+
+    def read_after_everyone_is_in_flight():
+        barrier.wait()
+        return read_token()
+
     monkeypatch.setenv("DATABRICKS_APP_NAME", "mcp-question-ranking")
     monkeypatch.setattr(utils, "WorkspaceClient", _FakeWorkspaceClient)
+    monkeypatch.setattr(
+        utils, "get_user_authenticated_workspace_client", read_after_everyone_is_in_flight
+    )
 
     def whoami_as(token):
         headers = {utils.USER_TOKEN_HEADER: token} if token else {}
         return _call_tool(client, "whoami", {}, headers=headers)["user"]
 
-    tokens = ["tok-a", "tok-b", "tok-c", "tok-d", None]
-    started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=len(tokens)) as pool:
         users = list(pool.map(whoami_as, tokens))
-    elapsed = time.perf_counter() - started
 
     for token, user in zip(tokens[:-1], users[:-1], strict=True):
-        assert user["user_name"] == f"user-for-{token}"
-    assert "No user token found" in users[-1]["error"]
-    # Five 0.2 s calls would take >= 1.0 s serially; well under proves overlap.
-    assert elapsed < 0.9, f"requests did not overlap ({elapsed:.2f}s)"
+        assert user.get("user_name") == f"user-for-{token}", user
+    assert "No user token found" in users[-1]["error"], users[-1]
 
 
 # --------------------------------------------------------------------------- #
@@ -228,3 +241,11 @@ def test_tests_run_against_the_deployed_dependency_set(package):
     """
     locked = {p["name"]: p["version"] for p in tomllib.loads(APP_LOCK.read_text())["package"]}
     assert metadata.version(package) == locked[package]
+
+
+def test_app_has_no_requirements_txt():
+    """Databricks Apps uses pip, and ignores uv.lock, whenever requirements.txt exists.
+
+    Adding one would silently swap the locked FastMCP for whatever pip resolves.
+    """
+    assert not (APP_LOCK.parent / "requirements.txt").exists()

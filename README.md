@@ -44,7 +44,7 @@ MCP client (AI Playground, Claude Code, Cursor, agent)
 | `app/` | App source, including its own `app.yaml` |
 | `app/server/ranking.py` | All ranking logic — pure, no I/O, fully unit-tested |
 | `jobs/register_uc_mcp.py` | Idempotent UC connection + MCP service registration |
-| `app/uv.lock` | The exact dependency set the app deploys with (`uv run --frozen`) |
+| `app/uv.lock` | The exact dependency set the app deploys with (installed by `uv sync`) |
 | `tests/` | 112 tests (pure logic + real-protocol integration), no network or auth |
 
 ## The tools
@@ -147,9 +147,19 @@ Only if you also opt into UC MCP registration (see below):
 GRANT CREATE CONNECTION, CREATE SERVICE, USE SCHEMA
   ON SCHEMA prod_ai.`question-ranking-mcp` TO `<agents-deploy-application-id>`;
 
--- Only if you also pass a bearer token via mcp_bearer_token_secret:
-GRANT READ_SECRET ON SECRET <catalog>.<schema>.<secret> TO `<agents-deploy-application-id>`;
+-- Only if you also pass a bearer token via mcp_bearer_token_secret, where the UC Secret
+-- lives in <secret-catalog>.<secret-schema>:
+GRANT USE CATALOG ON CATALOG <secret-catalog> TO `<agents-deploy-application-id>`;
+GRANT USE SCHEMA, READ SECRET
+  ON SCHEMA <secret-catalog>.<secret-schema> TO `<agents-deploy-application-id>`;
 ```
+
+The secret grants use the schema-level form shown in the Databricks
+[Unity Catalog secrets](https://docs.databricks.com/aws/en/security/secrets/unity-catalog-secrets)
+docs, which also covers secrets added to that schema later. `READ SECRET` is the privilege
+that lets a principal use a secret's value; `REFERENCE SECRET` only makes it discoverable,
+so it is not enough here. No `MANAGE` or ownership is needed, because the job never reads
+the secret's metadata itself.
 
 Note the backticks. Hyphens are legal in a UC schema name, and the bundle YAML takes the
 literal `question-ranking-mcp`, but **SQL requires backtick-quoting**:
@@ -168,11 +178,12 @@ literal `question-ranking-mcp`, but **SQL requires backtick-quoting**:
 databricks bundle validate -t dev  --profile <your-profile>
 databricks bundle validate -t prod --profile <prod-profile>
 
-# Deploy the bundle, then deploy and start the app's code.
+# Every deploy is these two steps, in this order: on the first install and after every
+# change alike. Never run the first without the second.
 databricks bundle deploy -t prod --profile <prod-profile>
 databricks bundle run question_ranking_mcp -t prod --profile <prod-profile>
 
-# The same for dev.
+# dev: the same two steps.
 databricks bundle deploy -t dev --profile <your-profile>
 databricks bundle run question_ranking_mcp -t dev --profile <your-profile>
 
@@ -180,29 +191,33 @@ databricks bundle run question_ranking_mcp -t dev --profile <your-profile>
 databricks apps get mcp-question-ranking --profile <prod-profile> | jq -r .url
 ```
 
-**Always follow `bundle deploy` with `bundle run question_ranking_mcp`** — that runs the
-app resource by its bundle key. `bundle deploy` uploads the source but does not reliably
-ship it to the app:
+The two steps do different jobs:
 
-- On a **fresh install**, `lifecycle.started: true` makes `bundle deploy` start the app and
-  create its first deployment from the synced source.
-- On a **later deploy that only changes app code**, `bundle deploy` uploads the new files
-  but does not redeploy the app. The CLI only re-runs the app's lifecycle step when an app
-  *config* field changes, so the app keeps serving the previous code.
+1. **`bundle deploy`** creates or updates the schema, the endpoint, the job and the app,
+   and uploads the app's source. `lifecycle.started: true` keeps the app's compute
+   running.
+2. **`bundle run question_ranking_mcp`** ships the uploaded source to the app. It starts
+   the app's compute if it is stopped, then always creates a new deployment from the
+   bundle's synced source. `question_ranking_mcp` is the app's resource key.
 
-`bundle run` on an app starts its compute if stopped and then always creates a new
-deployment from the bundle's synced source. Do not use `databricks apps start` for this: it
-starts compute and resumes the *last* deployment, so it can bring stale code back up.
+`bundle deploy` alone does **not** redeploy the app when only its code changed, so a
+deploy without the `run` can leave the app serving old code. Treat `run` as part of every
+deploy rather than deciding case by case. Do not use `databricks apps start` instead: it
+starts compute and resumes the *last* deployment, which can bring stale code back up.
 
 ### Choosing a workspace
 
-`dev` has **no pinned host**: it deploys to whichever workspace `--profile` selects, so
-any developer can use it with their own profile.
+Both targets are **pinned** to a host in `databricks.yml`:
 
-`prod` is **pinned** to `https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com`.
-The CLI **rejects** a `--profile` whose host differs from a target's explicit
-`workspace.host` — a profile cannot redirect `prod`. To deploy `prod` elsewhere, change
-`targets.prod.workspace.host` in `databricks.yml`.
+| Target | Host |
+|---|---|
+| `dev` | `https://fevm-perdomo-demos.cloud.databricks.com` |
+| `prod` | `https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com` |
+
+The CLI **rejects** a `--profile` whose host differs from the target's `workspace.host`,
+so a profile can never redirect a target. In particular, `-t dev` cannot be pointed at the
+production sandbox by mistake. To use a different workspace, change that target's
+`workspace.host`.
 
 ### App names in `dev`
 
@@ -373,23 +388,18 @@ That is the documented limitation, not a defect in the bundle.
 ### The bearer token must be a Unity Catalog Secret
 
 `mcp_bearer_token_secret` takes a **Unity Catalog Secret** as a three-level fully
-qualified name, `<catalog>.<schema>.<secret>` — the form that
-`connections.create(secrets=...)` documents ("UC Secret fully qualified names") and that
-`secrets_uc.get_secret` accepts.
+qualified name, `<catalog>.<schema>.<secret>`, which is the form
+`connections.create(secrets=...)` documents ("UC Secret fully qualified names").
 
 It is **not** a workspace secret scope. A `<scope>/<key>` path, with or without a
-`secrets/` prefix, is a different and incompatible namespace; the job validates the format
-up front and rejects it with an explicit message rather than letting it fail opaquely
-inside the connections API. The job also preflights the secret with
-`secrets_uc.get_secret` so a missing secret or a missing `READ_SECRET` grant produces a
-clear error instead of a confusing connection failure.
+`secrets/` prefix, is a different and incompatible namespace. The job checks the format
+locally before calling anything, and rejects a wrong one with an explicit message.
 
-> One ambiguity worth flagging, since it is unverified against a live workspace: a sibling
-> API (model provider services) documents its secret references in the **resource-name**
-> form `secrets/{catalog}.{schema}.{secret}`, while the connections `secrets` map is
-> documented as a bare fully qualified name. This bundle follows the connections API's own
-> wording. If a real registration attempt ever gets far enough to reject the secret
-> reference specifically, try the `secrets/`-prefixed form.
+The job does not check that the secret exists. That check would need ownership or
+`MANAGE` on the secret, more than registration itself needs. Instead,
+`connections.create` validates the reference, and if it rejects it, the job stops with
+the API's own error plus the grants to check: `USE CATALOG` and `USE SCHEMA` on the
+secret's parents, `READ SECRET` on the secret, and `CREATE CONNECTION` on the schema.
 
 If a future release does support it, the MCP would be consumed as:
 
@@ -421,10 +431,15 @@ There are two test files, and neither needs network access or Databricks auth:
   tests cannot see: `best_question` once broke on a FastMCP version that turned decorated
   tools into non-callable objects, and no pure test noticed.
 
-The deployed app runs `uv run --frozen` against `app/uv.lock`. A drift test fails if the
-dev environment resolves different versions of the key packages, so the tests always run
-against the dependency set that actually ships. After changing dependencies, refresh both
-locks:
+At deploy time, Databricks Apps installs the app with `uv sync` from `app/uv.lock`. It
+does that because `app/` contains `pyproject.toml` and `uv.lock` and **no
+`requirements.txt`**. Do not add one: if `requirements.txt` exists, Apps uses pip instead
+and ignores the lock. At boot, `uv run --frozen` starts the server from that venv without
+re-resolving or installing anything.
+
+A drift test fails if the dev environment resolves different versions of the key
+packages, so the tests always run against the dependency set that actually ships. After
+changing dependencies, refresh both locks:
 
 ```bash
 uv lock --project app && uv lock && uv sync

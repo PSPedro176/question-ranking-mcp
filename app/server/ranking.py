@@ -228,12 +228,12 @@ def parse_scores(response_text: str, question_count: int) -> list[ScoredItem]:
     1. A row with a valid explicit ``index`` claims that question. The first
        claim wins; a later row repeating the same index is discarded - it is
        never moved onto a different question.
-    2. A row whose ``index`` is present but invalid (out of range, negative,
-       fractional, non-finite or non-numeric) is discarded.
-    3. Rows without an index are matched by position ONLY when no row in the
-       response carries an index AND the row count equals the question count,
-       i.e. the model plainly answered every question in order. Any other mix
-       is ambiguous, so index-less rows are discarded.
+    2. A row whose ``index`` key is present but invalid (``null``, out of
+       range, negative, fractional, non-finite or non-numeric) is discarded.
+    3. Rows with NO ``index`` key are matched by position ONLY when no row in
+       the response has an ``index`` key AND the row count equals the question
+       count, i.e. the model plainly answered every question in order. Any
+       other mix is ambiguous, so those rows are discarded.
 
     Questions left unclaimed get ``FALLBACK_SCORE`` with ``matched=False``.
     Never raises, whatever the model returned.
@@ -242,7 +242,8 @@ def parse_scores(response_text: str, question_count: int) -> list[ScoredItem]:
         return []
 
     rows = _coerce_rows(_extract_json_payload(response_text))
-    positional = len(rows) == question_count and all(row.get("index") is None for row in rows)
+    # Key ABSENCE, not a None value: `{"index": null}` states an index and is invalid.
+    positional = len(rows) == question_count and all("index" not in row for row in rows)
 
     items: dict[int, ScoredItem] = {}
     for position, row in enumerate(rows):

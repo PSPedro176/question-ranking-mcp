@@ -123,16 +123,17 @@ secrets = None
 
 
 def resolve_uc_secret(reference: str) -> str:
-    """Validate a Unity Catalog Secret reference and confirm it exists.
+    """Validate the FORMAT of a Unity Catalog Secret reference. Purely local.
+
+    Deliberately no `secrets_uc.get_secret` preflight: that call needs secret
+    ownership, metastore admin or MANAGE, so it would reject a valid secret held with
+    only READ SECRET. `connections.create` validates the reference itself; its
+    rejection is surfaced below with an actionable message.
 
     `connections.create(secrets=...)` maps a connection option name to a **UC Secret
     fully qualified name** - a three-level `catalog.schema.secret`. It is NOT a workspace
     secret-scope path: `<scope>/<key>` and `secrets/<scope>/<key>` are a different,
     incompatible namespace and are rejected here rather than passed on to fail opaquely.
-
-    Note the sibling convention: model provider services take the resource-name form
-    `secrets/{catalog}.{schema}.{secret}`, but the connections `secrets` map is documented
-    as a bare fully qualified name, which is what `secrets_uc.get_secret` also takes.
     """
     if "/" in reference:
         raise ValueError(
@@ -148,16 +149,6 @@ def resolve_uc_secret(reference: str) -> str:
             f"bearer_token_secret must have exactly three non-empty parts "
             f"'<catalog>.<schema>.<secret>', got {reference!r}."
         )
-
-    # Preflight: turn an opaque downstream connection error into an actionable one.
-    try:
-        w.secrets_uc.get_secret(full_name=reference)
-    except NotFound as exc:
-        raise ValueError(
-            f"Unity Catalog Secret {reference!r} does not exist (or is not visible to this "
-            f"identity): {exc}\nCreate it, and grant this identity READ_SECRET on it."
-        ) from exc
-    print(f"Verified UC Secret exists: {reference}")
     return reference
 
 
@@ -175,14 +166,29 @@ try:
     print(f"Connection already exists, reusing: {existing.full_name or CONNECTION_FULL_NAME}")
 except NotFound:
     print(f"Creating HTTP connection {CONNECTION_FULL_NAME} -> {app_url}{BASE_PATH}")
-    w.connections.create(
-        name=CONNECTION_NAME,
-        connection_type=ConnectionType.HTTP,
-        options=options,
-        parent=PARENT,
-        secrets=secrets,
-        comment="HTTP connection to the question-ranking MCP server on Databricks Apps.",
-    )
+    try:
+        w.connections.create(
+            name=CONNECTION_NAME,
+            connection_type=ConnectionType.HTTP,
+            options=options,
+            parent=PARENT,
+            secrets=secrets,
+            comment="HTTP connection to the question-ranking MCP server on Databricks Apps.",
+        )
+    except DatabricksError as exc:
+        hint = (
+            f"If the error concerns the bearer token, check that UC Secret "
+            f"{BEARER_TOKEN_SECRET!r} exists and that this identity has USE CATALOG and "
+            "USE SCHEMA on its parents plus READ SECRET on it."
+            if BEARER_TOKEN_SECRET
+            else "No bearer_token_secret was supplied; 'bearer_token' is a required option "
+            "for a bearer-token HTTP connection."
+        )
+        raise RuntimeError(
+            f"Unity Catalog rejected creating connection {CONNECTION_FULL_NAME}: "
+            f"[{type(exc).__name__}] {exc}\n{hint}\n"
+            f"Creating a connection also needs CREATE CONNECTION on schema {CATALOG}.{SCHEMA}."
+        ) from exc
 
 # COMMAND ----------
 

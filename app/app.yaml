@@ -1,8 +1,12 @@
 # Databricks Apps runtime config.
 # NOTE: this file uses camelCase `valueFrom`. The DABs equivalent in
 # resources/app.yml uses snake_case `value_from`. Both are real and different.
-# `--frozen` installs exactly what app/uv.lock pins and never re-resolves, so the
-# deployed dependency set is the one the tests ran against.
+#
+# Dependencies: there is deliberately no requirements.txt. With pyproject.toml + uv.lock
+# and no requirements.txt, Databricks Apps installs with `uv sync` from the lock at deploy
+# time. `uv run --frozen` then starts the app from that same venv without re-resolving,
+# so nothing is installed at boot. It is used instead of a bare `python` because the docs
+# do not say the synced venv is on PATH.
 command: ["uv", "run", "--frozen", "question-ranking-mcp"]
 
 env:

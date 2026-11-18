@@ -1,4 +1,0 @@
-# The Apps runtime installs this file, then `uv run --frozen` (see app.yaml) installs the
-# exact dependency set pinned in uv.lock. Bounded to the uv major the lockfile was
-# produced with.
-uv>=0.13,<1

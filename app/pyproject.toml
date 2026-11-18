@@ -6,8 +6,9 @@ requires-python = ">=3.11"
 # Floors are the versions in app/uv.lock that the test suite runs against; ceilings
 # stop a future lock refresh from silently crossing a major. fastmcp matters most:
 # its `@tool` decorator semantics changed across majors (see server/tools.py).
-# At runtime app.yaml runs `uv run --frozen`, so the deployed set is exactly
-# app/uv.lock regardless of these ranges.
+# Databricks Apps installs this project with `uv sync` from app/uv.lock (there is no
+# requirements.txt, which would switch it to pip), so the deployed set is exactly the
+# lock regardless of these ranges.
 dependencies = [
     "fastmcp>=4.2,<5",
     "fastapi>=0.162,<1",
