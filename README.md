@@ -45,7 +45,7 @@ MCP client (AI Playground, Claude Code, Cursor, agent)
 | `app/server/ranking.py` | All ranking logic — pure, no I/O, fully unit-tested |
 | `jobs/register_uc_mcp.py` | Idempotent UC connection + MCP service registration |
 | `app/uv.lock` | The exact dependency set the app deploys with (installed by `uv sync`) |
-| `tests/` | 112 tests (pure logic + real-protocol integration), no network or auth |
+| `tests/` | Pure-logic and real-protocol integration tests, no network or auth |
 
 ## The tools
 
@@ -150,14 +150,15 @@ GRANT CREATE CONNECTION, CREATE SERVICE, USE SCHEMA
 -- Only if you also pass a bearer token via mcp_bearer_token_secret, where the UC Secret
 -- lives in <secret-catalog>.<secret-schema>:
 GRANT USE CATALOG ON CATALOG <secret-catalog> TO `<agents-deploy-application-id>`;
-GRANT USE SCHEMA, READ SECRET
-  ON SCHEMA <secret-catalog>.<secret-schema> TO `<agents-deploy-application-id>`;
+GRANT USE SCHEMA ON SCHEMA <secret-catalog>.<secret-schema> TO `<agents-deploy-application-id>`;
+GRANT READ SECRET
+  ON SECRET <secret-catalog>.<secret-schema>.<secret-name> TO `<agents-deploy-application-id>`;
 ```
 
-The secret grants use the schema-level form shown in the Databricks
+`READ SECRET` is granted on the one secret only, not on the schema, so the principal cannot
+read other current or future secrets there (see the Databricks
 [Unity Catalog secrets](https://docs.databricks.com/aws/en/security/secrets/unity-catalog-secrets)
-docs, which also covers secrets added to that schema later. `READ SECRET` is the privilege
-that lets a principal use a secret's value; `REFERENCE SECRET` only makes it discoverable,
+docs). `READ SECRET` is the privilege that lets a principal use a secret's value; `REFERENCE SECRET` only makes it discoverable,
 so it is not enough here. No `MANAGE` or ownership is needed, because the job never reads
 the secret's metadata itself.
 
@@ -194,14 +195,17 @@ databricks apps get mcp-question-ranking --profile <prod-profile> | jq -r .url
 The two steps do different jobs:
 
 1. **`bundle deploy`** creates or updates the schema, the endpoint, the job and the app,
-   and uploads the app's source. `lifecycle.started: true` keeps the app's compute
-   running.
+   and uploads the app's source. With `lifecycle.started: true` it also starts the app's
+   compute, and when the app is first created or its resource config changes, it creates a
+   deployment from the uploaded source.
 2. **`bundle run question_ranking_mcp`** ships the uploaded source to the app. It starts
    the app's compute if it is stopped, then always creates a new deployment from the
    bundle's synced source. `question_ranking_mcp` is the app's resource key.
 
 `bundle deploy` alone does **not** redeploy the app when only its code changed, so a
-deploy without the `run` can leave the app serving old code. Treat `run` as part of every
+deploy without the `run` can leave the app serving old code. The first install would
+usually come up from `deploy` alone, but always running both steps is what keeps every
+deploy correct. Treat `run` as part of every
 deploy rather than deciding case by case. Do not use `databricks apps start` instead: it
 starts compute and resumes the *last* deployment, which can bring stale code back up.
 
@@ -434,8 +438,9 @@ There are two test files, and neither needs network access or Databricks auth:
 At deploy time, Databricks Apps installs the app with `uv sync` from `app/uv.lock`. It
 does that because `app/` contains `pyproject.toml` and `uv.lock` and **no
 `requirements.txt`**. Do not add one: if `requirements.txt` exists, Apps uses pip instead
-and ignores the lock. At boot, `uv run --frozen` starts the server from that venv without
-re-resolving or installing anything.
+and ignores the lock. At boot, `uv run --frozen` starts the server from that environment. It never
+re-resolves or rewrites the lock, and because the environment is already in sync it
+normally has nothing to install.
 
 A drift test fails if the dev environment resolves different versions of the key
 packages, so the tests always run against the dependency set that actually ships. After
