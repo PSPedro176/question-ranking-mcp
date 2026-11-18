@@ -1,0 +1,69 @@
+# hello-mcp: a minimal MCP server registered in Unity Catalog, deployed 100% by this bundle.
+#
+#   schema  -> app (FastMCP on Databricks Apps) -> job_run (creates the UC HTTP connection)
+#           -> mcp_service (UC MCP service, <catalog>.<schema>.<mcp_service_id>)
+bundle:
+  name: hello-mcp
+  databricks_cli_version: ">=1.23.0"
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Existing UC catalog. The deploy identity needs USE CATALOG + CREATE SCHEMA.
+    default: dev_ai
+  schema:
+    description: UC schema created by this bundle; holds the connection and the MCP service.
+    default: hello_mcp
+  app_name:
+    description: Databricks App name. Must start with `mcp-` and be at most 30 characters.
+    default: mcp-hello
+  mcp_service_id:
+    description: Name of the UC MCP service. Full name is <catalog>.<schema>.<mcp_service_id>.
+    default: hello
+  connection_name:
+    description: Name of the schema-level UC HTTP connection backing the MCP service.
+    default: hello_mcp_conn
+  # Grants are explicit and empty by default: only the owner (the deployer) can use the MCP.
+  # Complex variables cannot be set with --var or BUNDLE_VAR_*, so to let others use it
+  # override both lists under `targets.<target>.variables` (see the commented example below).
+  # They are separate lists because bundle variables cannot be mapped. USE CATALOG on the
+  # catalog is NOT managed by this bundle (the catalog pre-exists); the principals need it too.
+  mcp_service_grants:
+    description: "Grants on the MCP service, a list of {principal, privileges: [EXECUTE]}."
+    type: complex
+    default: []
+  schema_grants:
+    description: "Grants on the schema, a list of {principal, privileges: [USE_SCHEMA]}."
+    type: complex
+    default: []
+
+targets:
+  # Both targets deploy to the same workspace; they differ only in catalog and app name.
+  # No `mode: development`: it would prefix the schema and rename resources, but the stack
+  # must live at exactly <catalog>.hello_mcp.hello so it can be referenced by name.
+  # Bundle state is per target (default root_path ~/.bundle/<bundle>/<target>), so the two
+  # targets do not share state. App names are workspace-global, hence the different names.
+  dev:
+    default: true
+    workspace:
+      host: https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com
+    variables:
+      catalog: dev_ai
+      app_name: mcp-hello
+      # mcp_service_grants:
+      #   - {principal: my-group, privileges: [EXECUTE]}
+      # schema_grants:
+      #   - {principal: my-group, privileges: [USE_SCHEMA]}
+
+  prod:
+    workspace:
+      host: https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com
+    variables:
+      catalog: prod_ai
+      app_name: mcp-hello-prod
+      # mcp_service_grants:
+      #   - {principal: my-group, privileges: [EXECUTE]}
+      # schema_grants:
+      #   - {principal: my-group, privileges: [USE_SCHEMA]}
