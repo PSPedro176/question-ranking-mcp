@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from server import llm, tools, utils
 from server.app import combined_app
 
-ENDPOINT = "question-ranking-router"
+MODEL_SERVICE = "prod_ai.question-ranking-mcp.question_ranking_router"
 MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 GOOD_RESPONSE = (
     '[{"index": 1, "score": 2, "rationale": "too vague"},'
@@ -39,13 +39,13 @@ def client():
 
 
 @pytest.fixture(autouse=True)
-def _endpoint_env(monkeypatch):
-    monkeypatch.setenv("SERVING_ENDPOINT", ENDPOINT)
+def _model_service_env(monkeypatch):
+    monkeypatch.setenv("MODEL_SERVICE", MODEL_SERVICE)
 
 
 @pytest.fixture
 def llm_returns(monkeypatch):
-    """Stub the 50/50 endpoint with a canned response."""
+    """Stub the 50/50 model service with a canned response."""
 
     def _set(text: str):
         monkeypatch.setattr(llm, "complete", lambda prompt, **kw: text)
@@ -119,7 +119,7 @@ def test_rank_questions_success(client, llm_returns):
     result = _call_tool(client, "rank_questions", {"questions": QUESTIONS})
     assert [r["question"] for r in result["ranked"]] == [QUESTIONS[1], QUESTIONS[0]]
     assert result["model_scored"] == 2
-    assert result["endpoint"] == ENDPOINT
+    assert result["model_service"] == MODEL_SERVICE
 
 
 def test_best_question_success(client, llm_returns):
@@ -131,7 +131,7 @@ def test_best_question_success(client, llm_returns):
         "score": 9.0,
         "rationale": "specific and answerable",
         "runner_up": QUESTIONS[0],
-        "endpoint": ENDPOINT,
+        "model_service": MODEL_SERVICE,
     }
 
 
@@ -141,21 +141,22 @@ def test_best_question_with_one_question_has_no_runner_up(client, llm_returns):
 
 
 @pytest.mark.parametrize("tool", ["rank_questions", "best_question"])
-def test_ranking_tools_report_endpoint_failure(client, monkeypatch, tool):
+def test_ranking_tools_report_model_service_failure(client, monkeypatch, tool):
     def boom(prompt, **kw):
-        raise RuntimeError("endpoint unavailable")
+        raise RuntimeError("model service unavailable")
 
     monkeypatch.setattr(llm, "complete", boom)
     result = _call_tool(client, tool, {"questions": QUESTIONS})
-    assert result["error"] == "endpoint_query_failed"
-    assert "endpoint unavailable" in result["message"]
+    assert result["error"] == "model_service_query_failed"
+    assert "model service unavailable" in result["message"]
 
 
 @pytest.mark.parametrize("tool", ["rank_questions", "best_question"])
-def test_ranking_tools_report_missing_endpoint_config(client, monkeypatch, llm_returns, tool):
+def test_ranking_tools_report_missing_model_service_config(client, monkeypatch, llm_returns, tool):
     llm_returns(GOOD_RESPONSE)
-    monkeypatch.delenv("SERVING_ENDPOINT")
-    assert _call_tool(client, tool, {"questions": QUESTIONS})["error"] == "endpoint_query_failed"
+    monkeypatch.delenv("MODEL_SERVICE")
+    result = _call_tool(client, tool, {"questions": QUESTIONS})
+    assert result["error"] == "model_service_query_failed"
 
 
 @pytest.mark.parametrize("tool", ["rank_questions", "best_question"])
@@ -170,6 +171,64 @@ def test_malformed_model_numerics_return_a_structured_result(client, llm_returns
     result = _call_tool(client, "rank_questions", {"questions": QUESTIONS})
     assert result["model_scored"] == 0
     assert [r["score"] for r in result["ranked"]] == [5.0, 5.0]
+
+
+# --------------------------------------------------------------------------- #
+# Model-service client (llm.py)
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingApiClient:
+    """Captures the request llm.complete sends and returns a canned response."""
+
+    def __init__(self, response):
+        self.response, self.calls = response, []
+
+    def do(self, method, path=None, body=None, **kwargs):
+        self.calls.append({"method": method, "path": path, "body": body})
+        return self.response
+
+
+def _chat_response(content, **message_extra):
+    """Shape copied from live Unity Gateway Chat Completions responses."""
+    return {
+        "choices": [{"message": {"role": "assistant", "content": content, **message_extra}}],
+        "id": "x",
+        "model": "m",
+        "object": "chat.completion",
+        "created": 0,
+        "usage": {},
+    }
+
+
+def test_complete_calls_the_model_service_by_full_name(monkeypatch):
+    api = _RecordingApiClient(_chat_response('[{"index": 1, "score": 7}]'))
+    monkeypatch.setattr(llm, "WorkspaceClient", lambda: SimpleNamespace(api_client=api))
+
+    assert llm.complete("rank these") == '[{"index": 1, "score": 7}]'
+    (call,) = api.calls
+    assert (call["method"], call["path"]) == ("POST", "/ai-gateway/mlflow/v1/chat/completions")
+    assert call["body"]["model"] == MODEL_SERVICE
+    assert call["body"]["messages"] == [{"role": "user", "content": "rank these"}]
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        # gpt-oss returns its reasoning separately; only `content` is the answer.
+        (_chat_response("[1]", reasoning_content="thinking..."), "[1]"),
+        (
+            _chat_response([{"type": "reasoning", "text": "x"}, {"type": "text", "text": "[2]"}]),
+            "[2]",
+        ),
+        (_chat_response(None), ""),
+        ({"choices": []}, ""),
+        ({}, ""),
+        ([], ""),
+    ],
+)
+def test_first_message_content_tolerates_response_shapes(response, expected):
+    assert llm._first_message_content(response) == expected
 
 
 # --------------------------------------------------------------------------- #

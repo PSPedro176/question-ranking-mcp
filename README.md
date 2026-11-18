@@ -1,8 +1,9 @@
 # question-ranking-mcp
 
 A custom **MCP server on Databricks Apps** that ranks questions by quality and
-relevance, scoring them with a **Model Serving endpoint that splits traffic 50/50 across
-two open-source models**. Everything deploys from a single Declarative Automation Bundle.
+relevance, scoring them with a **Unity Gateway model service that splits traffic 50/50
+across two open-source models**. Everything deploys from a single Declarative Automation
+Bundle.
 
 Splitting the traffic is the point: question quality is subjective, and routing half the
 scoring calls to each of two different open-source models keeps the rankings from
@@ -20,12 +21,13 @@ MCP client (AI Playground, Claude Code, Cursor, agent)
 │    tools: rank_questions, best_question,    │
 │           whoami                            │
 └───────────────────┬─────────────────────────┘
-                    │  CAN_QUERY as the app's own service principal
+                    │  EXECUTE as the app's own service principal
                     ▼
 ┌─────────────────────────────────────────────┐
-│ 2. Serving endpoint: question-ranking-router│   resources/serving.yml
-│    50% system.ai.llama_v3_2_3b_instruct     │
-│    50% system.ai.mistral_7b_instruct_v0_2   │
+│ 2. Model service: question_ranking_router   │   resources/model_service.yml
+│    in prod_ai.`question-ranking-mcp`        │
+│    50% system.ai.gpt-oss-20b                │
+│    50% system.ai.qwen3-next-80b-a3b-instruct│
 └─────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────┐
@@ -39,7 +41,7 @@ MCP client (AI Playground, Claude Code, Cursor, agent)
 |---|---|
 | `databricks.yml` | Bundle root: variables and the `dev` / `prod` targets |
 | `resources/app.yml` | The MCP server on Databricks Apps |
-| `resources/serving.yml` | The 50/50 traffic-split endpoint |
+| `resources/model_service.yml` | The 50/50 model service |
 | `resources/uc.yml` | UC schema + the opt-in registration job |
 | `app/` | App source, including its own `app.yaml` |
 | `app/server/ranking.py` | All ranking logic — pure, no I/O, fully unit-tested |
@@ -53,55 +55,54 @@ MCP client (AI Playground, Claude Code, Cursor, agent)
 |---|---|---|
 | `rank_questions` | `(questions: list[str], context: str \| None)` | All questions sorted best-first with `rank`, `score` (0–10) and `rationale` |
 | `best_question` | `(questions: list[str], context: str \| None)` | Just the strongest question, plus the runner-up |
-| `whoami` | `()` | Calling user and the configured endpoint; doubles as a health check |
+| `whoami` | `()` | Calling user and the configured model service; doubles as a health check |
 
 `context` is optional. Supply it and scores become relevance-aware; omit it and they
 measure question quality alone. Input is capped at 25 questions of 500 characters each.
 
-Scoring is deliberately failure-tolerant. The two small instruct models behind the
-endpoint do not reliably emit clean JSON, so the parser accepts bare JSON, fenced blocks
+Scoring is deliberately failure-tolerant. The two models behind the model service do not
+reliably emit clean JSON, so the parser accepts bare JSON, fenced blocks
 and JSON wrapped in prose; keys rows back to the input by the model's `index` rather than
 trusting its ordering; and falls back to a neutral 5.0 for any question the model never
 scored. `rank_questions` reports `model_scored` so a caller can see how much of the
 ranking the model actually produced.
 
-## Why these two models
+## The model service and its two models
 
-The 50/50 split constrains the choice more than it first appears:
+The 50/50 split lives in a **Unity Gateway model service**: a Unity Catalog securable that
+routes each request to one of its destinations by `traffic_percentage`. It is defined in
+`resources/model_service.yml`, in `prod_ai`.`question-ranking-mcp`. Its destinations are
+**pay-per-token** Databricks foundation models, so there is no endpoint to provision,
+size or keep warm, and no idle cost.
 
-- **Pay-per-token Foundation Model endpoints cannot be traffic-split.** There is no
-  pay-per-token served-entity form, so the split has to live on an endpoint you own.
-- **One endpoint cannot mix model types.** Both entities must be provisioned throughput.
-- **Both entities must share a scaling family.** These two are throughput-band scaled
-  (`min_provisioned_throughput` / `max_provisioned_throughput`), so they coexist.
-
-| | Model | Version | `max_provisioned_throughput` |
+| | Model (Unity Catalog name) | License | Share |
 |---|---|---|---|
-| A | `system.ai.llama_v3_2_3b_instruct` | `2` | 22000 (one chunk) |
-| B | `system.ai.mistral_7b_instruct_v0_2` | `2` | 2450 (one chunk) |
+| A | `system.ai.gpt-oss-20b` | Apache-2.0 | 50% |
+| B | `system.ai.qwen3-next-80b-a3b-instruct` | Apache-2.0 | 50% |
 
-Both are genuinely open-source and small. `min_provisioned_throughput: 0` lets each scale
-to zero, and each maximum is exactly **one** throughput chunk — the cheapest valid
-configuration. `max_provisioned_throughput` must be a multiple of the model's
-`throughput_chunk_size`, which differs per model, hence the different numbers.
+Both are genuinely open-source (Apache-2.0), not only open-weights. Both are also cheap to
+run: `gpt-oss-20b` is a 21B model, and Qwen3-Next is a mixture-of-experts model with only
+about 3B parameters active per token. `meta-llama-3-1-8b-instruct` and `gemma-3-12b` are
+smaller still, but ship under the Llama Community License and Gemma Terms of Use, which
+restrict use.
 
-> **This model inventory was read from a fallback workspace, not the deploy target.**
-> Every model field is a bundle variable for that reason. If the target workspace offers a
-> different set, override rather than edit:
->
-> ```bash
-> databricks bundle deploy -t prod \
->   --var model_a_name=system.ai.<model> --var model_a_version=1 --var model_a_max_throughput=<chunk> \
->   --var model_b_name=system.ai.<model> --var model_b_version=1 --var model_b_max_throughput=<chunk>
-> ```
->
-> Read the valid chunk size from the model's PT serving metadata before overriding; a
-> throughput that is not a multiple of the chunk size is rejected at deploy.
+The two models are bundle variables. Give the **Unity Catalog** model name, which can
+differ from the serving endpoint name; for example, the endpoint
+`databricks-meta-llama-3-1-8b-instruct` is the model `system.ai.meta_llama_v3_1_8b_instruct`:
+
+```bash
+databricks bundle deploy -t prod --profile <prod-profile> \
+  --var model_a=system.ai.<model> --var model_b=system.ai.<model>
+```
+
+The app reaches the service through Unity Gateway's OpenAI-compatible Chat Completions
+API, `POST /ai-gateway/mlflow/v1/chat/completions`, passing the service's full name,
+`<catalog>.<schema>.<id>`, as `model`.
 
 ## Prerequisites
 
 - Databricks CLI **v1.23.0 or newer** (`databricks --version`).
-- Databricks Apps enabled in the workspace, in a region that supports Model Serving.
+- Databricks Apps enabled in the workspace, in a region that supports Unity Gateway.
 - Unity Catalog, with the **`prod_ai` catalog already existing**. The bundle creates only
   the schema. Creating a catalog is not reliably idempotent across workspaces and would
   need metastore-level rights, so it is deliberately out of scope — override
@@ -118,8 +119,9 @@ which **does not exist yet**. Create it, then grant exactly:
 |---|---|---|
 | Workspace | **Workspace access** entitlement | Required to deploy at all; a Consumer-access principal cannot |
 | Workspace | Can use **Databricks Apps** | To create the app |
-| Catalog `prod_ai` | `USE CATALOG`, `CREATE SCHEMA` | To create the `question-ranking-mcp` schema |
-| Both served models | `USE CATALOG` + `USE SCHEMA` on `system.ai`, `EXECUTE` on each model | To serve them from the endpoint |
+| Catalog `prod_ai` | `USE CATALOG`, `CREATE SCHEMA` | To create the `question-ranking-mcp` schema. As its owner, the principal can then create the model service in it (`CREATE SERVICE`) |
+| Both models | `USE CATALOG` + `USE SCHEMA` on `system.ai`, `EXECUTE` on each model | To create the model service, and to answer its queries. Model services use the **owner's** privileges, so callers need no access to the models themselves |
+| Catalog `prod_ai` | `MANAGE`, **or** `USE CATALOG` already granted to `account users` | So deploy can grant the app's service principal `USE CATALOG` automatically (see below) |
 
 **Unity Catalog SQL identifies a service principal by its application ID, not its
 display name.** ``TO `agents-deploy` `` would not grant the service principal — it would
@@ -137,9 +139,25 @@ GRANT USE CATALOG, CREATE SCHEMA ON CATALOG prod_ai TO `<agents-deploy-applicati
 
 GRANT USE CATALOG ON CATALOG system TO `<agents-deploy-application-id>`;
 GRANT USE SCHEMA  ON SCHEMA  system.ai TO `<agents-deploy-application-id>`;
-GRANT EXECUTE ON MODEL system.ai.llama_v3_2_3b_instruct  TO `<agents-deploy-application-id>`;
-GRANT EXECUTE ON MODEL system.ai.mistral_7b_instruct_v0_2 TO `<agents-deploy-application-id>`;
+-- Model names containing hyphens must be backtick-quoted.
+GRANT EXECUTE ON MODEL system.ai.`gpt-oss-20b`                   TO `<agents-deploy-application-id>`;
+GRANT EXECUTE ON MODEL system.ai.`qwen3-next-80b-a3b-instruct`   TO `<agents-deploy-application-id>`;
+
+-- One of these two, so deploy can grant the app's service principal USE CATALOG:
+GRANT MANAGE ON CATALOG prod_ai TO `<agents-deploy-application-id>`;
+-- or: GRANT USE CATALOG ON CATALOG prod_ai TO `account users`;
 ```
+
+**Why the `prod_ai` condition.** The app's `uc_securable` resource gives the app's service
+principal `EXECUTE` on the model service, and Databricks grants the parent `USE CATALOG`
+and `USE SCHEMA` automatically when the resource is added. Granting `USE SCHEMA` and
+`EXECUTE` is never a problem, because the deploying principal owns the schema and the
+service. `USE CATALOG` on `prod_ai`, which the bundle doesn't own, is only granted if
+**either** all account users already have it **or** the deploying principal has `MANAGE` on
+the catalog. The Databricks docs state this condition for the Unity Catalog volume
+resource; the model-service resource uses the same `uc_securable` mechanism. If you choose
+neither option, grant the app's service principal `USE CATALOG` on `prod_ai` by hand after
+the first deploy.
 
 Only if you also opt into UC MCP registration (see below):
 
@@ -166,11 +184,11 @@ Note the backticks. Hyphens are legal in a UC schema name, and the bundle YAML t
 literal `question-ranking-mcp`, but **SQL requires backtick-quoting**:
 ``prod_ai.`question-ranking-mcp` ``.
 
-> **`run_as` does not apply here.** Bundle `run_as` only affects jobs and pipelines.
-> Serving endpoints and Apps are owned by whichever identity ran `databricks bundle
-> deploy`, and the App additionally gets its *own* runtime service principal, distinct
-> from `agents-deploy`. That runtime principal is what receives `CAN_QUERY` on the
-> endpoint via the app's `resources` block — you do not grant it by hand.
+> **`run_as` does not apply here.** Bundle `run_as` only affects jobs and pipelines. The
+> schema, the model service and the app are owned by whichever identity ran
+> `databricks bundle deploy`. The app also gets its *own* runtime service principal,
+> distinct from `agents-deploy`, which receives `EXECUTE` on the model service through the
+> app's `resources` block; you do not grant it by hand.
 
 ## Deploy
 
@@ -194,7 +212,7 @@ databricks apps get mcp-question-ranking --profile <prod-profile> | jq -r .url
 
 The two steps do different jobs:
 
-1. **`bundle deploy`** creates or updates the schema, the endpoint, the job and the app,
+1. **`bundle deploy`** creates or updates the schema, the model service, the job and the app,
    and uploads the app's source. With `lifecycle.started: true` it also starts the app's
    compute, and when the app is first created or its resource config changes, it creates a
    deployment from the uploaded source.
@@ -246,13 +264,6 @@ databricks bundle deploy -t dev --profile <your-profile> --var app_name=mcp-<som
 Pass the **same** `--var` to `bundle run`. It resolves the app name from the same
 variable, so omitting it would target a different app.
 
-The endpoint provisions GPU capacity and can take several minutes to go green:
-
-```bash
-databricks serving-endpoints get question-ranking-router --profile <prod-profile> \
-  | jq '{ready: .state.ready, config_update: .state.config_update}'
-# usable once ready == READY and config_update == NOT_UPDATING
-```
 
 ## Connect an MCP client
 
@@ -272,7 +283,7 @@ authenticates you itself.
 
 ### Authenticating an external client
 
-The endpoint is protected: every request needs a Databricks **OAuth** access token in the
+The app's `/mcp` endpoint is protected: every request needs a Databricks **OAuth** access token in the
 `Authorization` header. **Personal access tokens are not supported** for MCP callers.
 
 **1. Get access to the app.** The caller needs the **CAN USE** permission on the app. The
@@ -330,9 +341,9 @@ and restart the client. Re-run step 2 only if the refresh token itself has lapse
 
 The app declares the `iam.current-user:read` user API scope, so Apps forwards the caller's
 token in `x-forwarded-access-token`; the `whoami` tool reads it. The `rank_questions` and
-`best_question` tools instead call the serving endpoint as the app's *own* service
-principal, so ranking works for any caller with CAN USE, without each user needing access
-to the endpoint.
+`best_question` tools instead call the model service as the app's *own* service
+principal, so ranking works for any caller with CAN USE on the app, without each user
+needing access to the model service or its models.
 
 ## Unity Catalog registration
 
@@ -454,7 +465,7 @@ Run the server locally:
 
 ```bash
 cd app
-SERVING_ENDPOINT=question-ranking-router uv run question-ranking-mcp
+MODEL_SERVICE=prod_ai.question-ranking-mcp.question_ranking_router uv run question-ranking-mcp
 curl localhost:8000/health
 ```
 

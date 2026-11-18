@@ -26,8 +26,8 @@ def rank_questions(questions: list[str], context: str | None = None) -> dict:
     """Rank questions from best to worst by quality and answerability.
 
     Scores each question from 0 (vague, unanswerable, or off-topic) to 10
-    (specific, answerable, highly relevant) using the Databricks serving
-    endpoint that splits traffic 50/50 across two open-source models, then
+    (specific, answerable, highly relevant) using the Unity Gateway model
+    service that splits traffic 50/50 across two open-source models, then
     returns them sorted best-first.
 
     Args:
@@ -42,7 +42,8 @@ def rank_questions(questions: list[str], context: str | None = None) -> dict:
             - ranked (list): One entry per question, best first, each with
               ``rank`` (1-based), ``question``, ``score`` (0-10) and
               ``rationale``.
-            - endpoint (str): The serving endpoint that produced the scores.
+            - model_service (str): Full name of the model service that produced
+              the scores.
             - model_scored (int): How many questions the model scored
               directly; any remainder received a neutral 5.0 fallback.
             - question_count (int): Number of questions ranked.
@@ -57,18 +58,18 @@ def rank_questions(questions: list[str], context: str | None = None) -> dict:
         return {"error": "invalid_questions", "message": str(exc)}
 
     try:
-        endpoint = llm.endpoint_name()
+        model_service = llm.model_service_name()
         response_text = llm.complete(build_prompt(cleaned, context))
     except Exception as exc:  # noqa: BLE001 - surfaced to the MCP client
         return {
-            "error": "endpoint_query_failed",
-            "message": f"Could not query the ranking endpoint: {exc}",
+            "error": "model_service_query_failed",
+            "message": f"Could not query the ranking model service: {exc}",
         }
 
     ranked, model_scored = rank_from_response(cleaned, response_text)
     return {
         "ranked": [item.as_dict() for item in ranked],
-        "endpoint": endpoint,
+        "model_service": model_service,
         "model_scored": model_scored,
         "question_count": len(cleaned),
     }
@@ -102,21 +103,21 @@ def best_question(questions: list[str], context: str | None = None) -> dict:
         "score": top["score"],
         "rationale": top["rationale"],
         "runner_up": ranked[1]["question"] if len(ranked) > 1 else None,
-        "endpoint": result["endpoint"],
+        "model_service": result["model_service"],
     }
 
 
 def whoami() -> dict:
-    """Report the calling user and this server's endpoint wiring.
+    """Report the calling user and this server's model-service wiring.
 
     Doubles as a health check: a successful response confirms the MCP
     transport works, the on-behalf-of-user token reached the server, and the
-    ranking endpoint name is configured.
+    ranking model service is configured.
 
     Returns:
         dict with ``status``, ``user`` (display name and username, or an
-        ``error`` key if the user token was unavailable) and ``endpoint``
-        (the configured ranking endpoint, or ``None`` if unset).
+        ``error`` key if the user token was unavailable) and ``model_service``
+        (the configured model service's full name, or ``None`` if unset).
     """
     try:
         current = utils.get_user_authenticated_workspace_client().current_user.me()
@@ -125,11 +126,11 @@ def whoami() -> dict:
         user = {"error": str(exc)}
 
     try:
-        endpoint = llm.endpoint_name()
+        model_service = llm.model_service_name()
     except RuntimeError:
-        endpoint = None
+        model_service = None
 
-    return {"status": "healthy", "user": user, "endpoint": endpoint}
+    return {"status": "healthy", "user": user, "model_service": model_service}
 
 
 TOOLS = (rank_questions, best_question, whoami)

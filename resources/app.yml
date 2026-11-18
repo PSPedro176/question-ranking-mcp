@@ -30,18 +30,16 @@ resources:
       config:
         command: ["uv", "run", "--frozen", "question-ranking-mcp"]
         env:
-          - name: SERVING_ENDPOINT
-            value_from: ranking-endpoint
+          - name: MODEL_SERVICE
+            value_from: ranking-model-service
 
-      # Grants the app's own runtime service principal CAN_QUERY on the 50/50 endpoint and
-      # resolves the endpoint name into SERVING_ENDPOINT above.
-      #
-      # This references the RESOURCE, not ${var.endpoint_name}: in `mode: development` DABs
-      # renames the endpoint to `dev_<user>_<name>`, and a bare variable would point the app
-      # at an endpoint that does not exist in that target.
+      # Grants the app's own runtime service principal EXECUTE on the 50/50 model service,
+      # and resolves the service's full name, <catalog>.<schema>.<id>, into MODEL_SERVICE.
+      # Built from the schema resource so `mode: development`'s renamed schema is used.
       resources:
-        - name: ranking-endpoint
-          description: The 50/50 question-ranking endpoint this MCP server scores against.
-          serving_endpoint:
-            name: ${resources.model_serving_endpoints.ranking_router.name}
-            permission: CAN_QUERY
+        - name: ranking-model-service
+          description: The 50/50 model service this MCP server scores against.
+          uc_securable:
+            securable_type: MODEL_SERVICE
+            securable_full_name: ${resources.schemas.mcp_schema.catalog_name}.${resources.schemas.mcp_schema.name}.${resources.model_services.ranking_router.model_service_id}
+            permission: EXECUTE

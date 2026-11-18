@@ -10,7 +10,7 @@
 command: ["uv", "run", "--frozen", "question-ranking-mcp"]
 
 env:
-  # Resolved from the app's `ranking-endpoint` serving_endpoint resource,
-  # declared in resources/app.yml.
-  - name: SERVING_ENDPOINT
-    valueFrom: ranking-endpoint
+  # Resolved from the app's `ranking-model-service` resource (resources/app.yml) to the
+  # model service's full name, <catalog>.<schema>.<id>.
+  - name: MODEL_SERVICE
+    valueFrom: ranking-model-service

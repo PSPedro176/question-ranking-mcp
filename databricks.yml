@@ -1,10 +1,10 @@
 # question-ranking-mcp
 #
 # One bundle, three components:
-#   1. resources/serving.yml  - a Model Serving endpoint splitting traffic 50/50
-#                               across two open-source provisioned-throughput models
-#   2. resources/app.yml      - the MCP server on Databricks Apps (streamable HTTP, /mcp)
-#   3. resources/uc.yml       - the Unity Catalog schema + the (opt-in) MCP registration job
+#   1. resources/model_service.yml - a Unity Gateway model service in the UC schema that
+#                                    routes 50/50 across two open-source foundation models
+#   2. resources/app.yml           - the MCP server on Databricks Apps (streamable HTTP, /mcp)
+#   3. resources/uc.yml            - the UC schema + the (opt-in) MCP registration job
 bundle:
   name: question-ranking-mcp
   databricks_cli_version: ">=1.23.0"
@@ -23,9 +23,11 @@ variables:
     description: UC schema created by this bundle. Hyphens are legal in a UC schema name.
     default: question-ranking-mcp
 
-  endpoint_name:
-    description: Name of the 50/50 traffic-split Model Serving endpoint.
-    default: question-ranking-router
+  model_service_id:
+    description: >-
+      Name of the 50/50 model service inside the schema. The app calls it by its full
+      name, <catalog>.<schema>.<model_service_id>.
+    default: question_ranking_router
 
   app_name:
     description: >-
@@ -34,37 +36,16 @@ variables:
     default: mcp-question-ranking
 
   # --- The 50/50 model pair -------------------------------------------------------------
-  # Both are open-source, small, and provisioned-throughput optimizable with the SAME
-  # throughput-band scaling family. Mixing scaling families in one endpoint is rejected,
-  # and pay-per-token entities cannot be traffic-split at all - hence our own endpoint with
-  # two provisioned-throughput `system.ai.*` entities.
-  #
-  # The model inventory was read from a fallback workspace, not the deploy target, so every
-  # model field is a variable: override per workspace instead of editing YAML.
-  model_a_name:
-    description: UC path of the first served model.
-    default: system.ai.llama_v3_2_3b_instruct
-  model_a_version:
-    description: Version of the first served model.
-    default: "2"
-  model_a_max_throughput:
-    description: >-
-      Max provisioned throughput for model A, in tokens/second. MUST be a multiple of the
-      model's throughput_chunk_size (22000 for llama_v3_2_3b_instruct); this is exactly one
-      chunk, the cheapest valid value.
-    default: 22000
-
-  model_b_name:
-    description: UC path of the second served model.
-    default: system.ai.mistral_7b_instruct_v0_2
-  model_b_version:
-    description: Version of the second served model.
-    default: "2"
-  model_b_max_throughput:
-    description: >-
-      Max provisioned throughput for model B, in tokens/second. One throughput_chunk_size
-      for mistral_7b_instruct_v0_2 (2450).
-    default: 2450
+  # Pay-per-token Databricks foundation models, so there is nothing to provision or keep
+  # warm. Both are Apache-2.0 licensed. Give the Unity Catalog model name, which can
+  # differ from the serving endpoint's name: for example the endpoint
+  # `databricks-meta-llama-3-1-8b-instruct` is the model `system.ai.meta_llama_v3_1_8b_instruct`.
+  model_a:
+    description: Unity Catalog name of the first pay-per-token foundation model.
+    default: system.ai.gpt-oss-20b
+  model_b:
+    description: Unity Catalog name of the second pay-per-token foundation model.
+    default: system.ai.qwen3-next-80b-a3b-instruct
 
   dev_app_suffix:
     description: >-
@@ -135,6 +116,4 @@ targets:
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
     # No top-level `permissions` block on purpose. The deploying identity already owns and
     # manages everything it creates, and naming `agents-deploy` here would force the CLI to
-    # resolve a principal that does not exist yet. It would also overwrite the serving
-    # endpoint's ACL on deploy, stripping the CAN_QUERY that the app's resource block grants
-    # to the app's runtime service principal.
+    # resolve a principal that does not exist yet.
