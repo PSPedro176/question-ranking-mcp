@@ -1,0 +1,14 @@
+resources:
+  apps:
+    hello_app:
+      name: ${var.app_name}
+      description: Hello-world MCP server (FastMCP, streamable HTTP at /mcp).
+      source_code_path: ../app
+      # Keeps compute running; code is shipped by `bundle run hello_app` (see Makefile).
+      lifecycle:
+        started: true
+      # The UC gateway calls the app with OAuth M2M as the app's own service principal, which
+      # needs CAN_USE on the app or the Apps proxy answers 401.
+      permissions:
+        - service_principal_name: ${resources.apps.hello_app.service_principal_client_id}
+          level: CAN_USE

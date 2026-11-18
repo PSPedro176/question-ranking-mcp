@@ -1,0 +1,59 @@
+# `connections` is not a bundle resource type, so a serverless job creates the UC HTTP
+# connection. job_run fires it on every deploy (it is idempotent) and mcp_service waits for it.
+resources:
+  jobs:
+    create_connection_job:
+      name: ${bundle.name}-create-connection
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${resources.schemas.hello_schema.catalog_name}
+        - name: schema
+          default: ${resources.schemas.hello_schema.name}
+        - name: app_name
+          default: ${resources.apps.hello_app.name}
+        - name: connection_name
+          default: ${var.connection_name}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "3"
+            dependencies:
+              - databricks-sdk>=0.167
+      tasks:
+        - task_key: create_connection
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/create_connection.py
+            parameters:
+              - --catalog
+              - "{{job.parameters.catalog}}"
+              - --schema
+              - "{{job.parameters.schema}}"
+              - --app_name
+              - "{{job.parameters.app_name}}"
+              - --connection_name
+              - "{{job.parameters.connection_name}}"
+
+  job_runs:
+    create_connection_run:
+      job_id: ${resources.jobs.create_connection_job.id}
+      lifecycle:
+        triggers:
+          - on_bundle_deploy: true
+
+  mcp_services:
+    hello_service:
+      parent: schemas/${resources.schemas.hello_schema.catalog_name}.${resources.schemas.hello_schema.name}
+      mcp_service_id: ${var.mcp_service_id}
+      comment: Hello-world MCP server hosted on Databricks Apps.
+      config:
+        source_connection:
+          name: connections/${resources.schemas.hello_schema.catalog_name}.${resources.schemas.hello_schema.name}.${var.connection_name}
+      lifecycle:
+        depends_on:
+          - resource: job_runs.create_connection_run
+      grants:
+        - principal: ${var.mcp_consumers}
+          privileges:
+            - EXECUTE
