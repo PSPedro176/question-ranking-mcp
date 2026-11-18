@@ -1,0 +1,26 @@
+# Component 2 of 3: a Unity Gateway model service that routes 50/50 across two
+# open-source, pay-per-token foundation models. It is a Unity Catalog securable in the
+# bundle's schema; the app calls it by its full name, <catalog>.<schema>.<id>.
+resources:
+  model_services:
+    ranking_router:
+      # The schema resource, not ${var.schema}: `mode: development` renames the schema.
+      parent: schemas/${resources.schemas.mcp_schema.catalog_name}.${resources.schemas.mcp_schema.name}
+      model_service_id: ${var.model_service_id}
+      comment: Routes question-ranking prompts 50/50 across two open-source models.
+
+      config:
+        routing:
+          # With more than one primary destination, traffic_percentage is required and the
+          # percentages must sum to 100.
+          destinations:
+            - name: model-a
+              destination_type: DESTINATION_TYPE_PAY_PER_TOKEN_FOUNDATION_MODEL
+              pay_per_token_config:
+                model: models/${var.model_a}
+              traffic_percentage: 50
+            - name: model-b
+              destination_type: DESTINATION_TYPE_PAY_PER_TOKEN_FOUNDATION_MODEL
+              pay_per_token_config:
+                model: models/${var.model_b}
+              traffic_percentage: 50

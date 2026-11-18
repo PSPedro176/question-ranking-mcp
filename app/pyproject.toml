@@ -1,0 +1,28 @@
+[project]
+name = "question-ranking-mcp"
+version = "0.1.0"
+description = "MCP server that ranks questions using a 50/50 open-source model endpoint"
+requires-python = ">=3.11"
+# Floors are the versions in app/uv.lock that the test suite runs against; ceilings
+# stop a future lock refresh from silently crossing a major. fastmcp matters most:
+# its `@tool` decorator semantics changed across majors (see server/tools.py).
+# Databricks Apps installs this project with `uv sync` from app/uv.lock (there is no
+# requirements.txt, which would switch it to pip), so the deployed set is exactly the
+# lock regardless of these ranges.
+dependencies = [
+    "fastmcp>=4.2,<5",
+    "fastapi>=0.162,<1",
+    "uvicorn>=0.54,<1",
+    "databricks-sdk>=0.167,<1",
+    "pydantic>=2.14,<3",
+]
+
+[project.scripts]
+question-ranking-mcp = "server.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["server"]

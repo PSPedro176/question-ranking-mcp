@@ -1,0 +1,16 @@
+# Databricks Apps runtime config.
+# NOTE: this file uses camelCase `valueFrom`. The DABs equivalent in
+# resources/app.yml uses snake_case `value_from`. Both are real and different.
+#
+# Dependencies: there is deliberately no requirements.txt. With pyproject.toml + uv.lock
+# and no requirements.txt, Databricks Apps installs with `uv sync` from the lock at deploy
+# time. `uv run --frozen` then starts the app from that same venv without re-resolving,
+# so nothing is installed at boot. It is used instead of a bare `python` because the docs
+# do not say the synced venv is on PATH.
+command: ["uv", "run", "--frozen", "question-ranking-mcp"]
+
+env:
+  # Resolved from the app's `ranking-model-service` resource (resources/app.yml) to the
+  # model service's full name, <catalog>.<schema>.<id>.
+  - name: MODEL_SERVICE
+    valueFrom: ranking-model-service

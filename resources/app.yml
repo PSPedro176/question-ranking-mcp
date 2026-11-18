@@ -1,0 +1,45 @@
+# Component 1 of 3: the custom MCP server on Databricks Apps.
+#
+# Serves streamable HTTP MCP at https://<app-url>/mcp. The `mcp-` name prefix is what makes
+# the AI Playground offer it in the MCP server picker.
+resources:
+  apps:
+    question_ranking_mcp:
+      name: ${var.app_name}
+      description: MCP server exposing question-ranking tools over streamable HTTP at /mcp.
+
+      # Keeps the app's compute running; without it `bundle deploy` leaves the app stopped.
+      # It does not reliably ship code: `bundle deploy` does not redeploy the app when only
+      # its code changed. So EVERY deploy is two steps - `bundle deploy`, then
+      # `bundle run question_ranking_mcp`, which ships the synced source. See the README.
+      lifecycle:
+        started: true
+
+      # Relative to THIS file, so app/ sits one level up.
+      source_code_path: ../app
+
+      # Needed for on-behalf-of-user calls: Apps only forwards the end user's token in the
+      # `x-forwarded-access-token` header when a scope is declared. The `whoami` tool reads
+      # it. MCP callers must use OAuth; personal access tokens are not supported.
+      user_api_scopes:
+        - iam.current-user:read
+
+      # This block mirrors app/app.yaml. NOTE the casing difference, which is real and
+      # intentional: DABs uses snake_case `value_from` here, while app/app.yaml uses
+      # camelCase `valueFrom`.
+      config:
+        command: ["uv", "run", "--frozen", "question-ranking-mcp"]
+        env:
+          - name: MODEL_SERVICE
+            value_from: ranking-model-service
+
+      # Grants the app's own runtime service principal EXECUTE on the 50/50 model service,
+      # and resolves the service's full name, <catalog>.<schema>.<id>, into MODEL_SERVICE.
+      # Built from the schema resource so `mode: development`'s renamed schema is used.
+      resources:
+        - name: ranking-model-service
+          description: The 50/50 model service this MCP server scores against.
+          uc_securable:
+            securable_type: MODEL_SERVICE
+            securable_full_name: ${resources.schemas.mcp_schema.catalog_name}.${resources.schemas.mcp_schema.name}.${resources.model_services.ranking_router.model_service_id}
+            permission: EXECUTE

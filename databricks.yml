@@ -1,0 +1,119 @@
+# question-ranking-mcp
+#
+# One bundle, three components:
+#   1. resources/model_service.yml - a Unity Gateway model service in the UC schema that
+#                                    routes 50/50 across two open-source foundation models
+#   2. resources/app.yml           - the MCP server on Databricks Apps (streamable HTTP, /mcp)
+#   3. resources/uc.yml            - the UC schema + the (opt-in) MCP registration job
+bundle:
+  name: question-ranking-mcp
+  databricks_cli_version: ">=1.23.0"
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: >-
+      Existing Unity Catalog catalog that owns the MCP schema. The bundle does NOT create
+      the catalog; the deploy identity needs USE CATALOG + CREATE SCHEMA on it.
+    default: prod_ai
+
+  schema:
+    description: UC schema created by this bundle. Hyphens are legal in a UC schema name.
+    default: question-ranking-mcp
+
+  model_service_id:
+    description: >-
+      Name of the 50/50 model service inside the schema. The app calls it by its full
+      name, <catalog>.<schema>.<model_service_id>.
+    default: question_ranking_router
+
+  app_name:
+    description: >-
+      Databricks App name. Keep the `mcp-` prefix so the AI Playground recognises it as an
+      MCP server.
+    default: mcp-question-ranking
+
+  # --- The 50/50 model pair -------------------------------------------------------------
+  # Pay-per-token Databricks foundation models, so there is nothing to provision or keep
+  # warm. Both are Apache-2.0 licensed. Give the Unity Catalog model name, which can
+  # differ from the serving endpoint's name: for example the endpoint
+  # `databricks-meta-llama-3-1-8b-instruct` is the model `system.ai.meta_llama_v3_1_8b_instruct`.
+  model_a:
+    description: Unity Catalog name of the first pay-per-token foundation model.
+    default: system.ai.gpt-oss-20b
+  model_b:
+    description: Unity Catalog name of the second pay-per-token foundation model.
+    default: system.ai.qwen3-next-80b-a3b-instruct
+
+  dev_app_suffix:
+    description: >-
+      Per-developer suffix for the `dev` app name, keeping two people deploying `dev` to one
+      workspace from colliding. Override it when your sanitised username is long enough to
+      push the name past the 30-character App limit:
+      `databricks bundle validate -t dev --var dev_app_suffix=<short>`.
+      Overriding `app_name` outright also works and takes precedence.
+    default: ${workspace.current_user.domain_friendly_name}
+
+  # --- Unity Catalog MCP registration (opt-in) ------------------------------------------
+  register_uc_mcp_service:
+    description: >-
+      When true, the `register_uc_mcp` job attempts to create a UC HTTP connection and MCP
+      service for the app. Defaults to false because Databricks documents Databricks
+      Apps-hosted MCP servers as an unsupported registration source - see the README. The
+      core deploy always succeeds either way; this only changes what the job does when run.
+    default: "false"
+
+  mcp_service_id:
+    description: Name of the UC MCP service, if registration is enabled.
+    default: question_ranking
+
+  uc_connection_name:
+    description: Name of the schema-level UC HTTP connection, if registration is enabled.
+    default: question_ranking_mcp_http
+
+  mcp_bearer_token_secret:
+    description: >-
+      Optional Unity Catalog Secret, as a three-level fully qualified name
+      "<catalog>.<schema>.<secret>", holding the bearer token for the UC HTTP connection.
+      This is a UC Secret, NOT a workspace secret scope: a "<scope>/<key>" path is a
+      different namespace and the job rejects it with an explicit error. `bearer_token` is a
+      required option for a bearer-token UC HTTP connection - see the README's Unity
+      Catalog registration section.
+    default: ""
+
+targets:
+  # Pinned on purpose. The CLI rejects a `--profile` whose host differs from an explicit
+  # `workspace.host`, so pinning is what stops `-t dev` from ever deploying into the
+  # production sandbox. To use another dev workspace, change the host here.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://fevm-perdomo-demos.cloud.databricks.com
+    variables:
+      # `mode: development` prefixes most resource names automatically but NOT app names,
+      # because app names have a restricted charset. Suffix it manually so two developers
+      # deploying `dev` to the same workspace do not fight over one app.
+      #
+      # App names allow only lowercase letters, digits and hyphens, with a 30-character
+      # limit, and `bundle validate` does NOT enforce either rule. Hence the short
+      # `mcp-qrank-` prefix (10 chars, 20 left for the suffix) and `domain_friendly_name`
+      # rather than `short_name`: short_name keeps underscores (`pedro_perdomo`), which are
+      # illegal, while domain_friendly_name is hyphen-sanitised (`pedro-perdomo`).
+      app_name: mcp-qrank-${var.dev_app_suffix}
+
+  # The real deploy target, pinned to one host. A `--profile` for a different host is
+  # rejected by the CLI; to retarget prod, change `workspace.host` here.
+  prod:
+    mode: production
+    workspace:
+      host: https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com
+      # `mode: production` requires an explicit root_path so only one copy is deployed.
+      # Scoping it to the deploying identity (the `agents-deploy` SP in a real deploy) keeps
+      # it restricted; a /Workspace/Shared root would be writable by every workspace user.
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    # No top-level `permissions` block on purpose. The deploying identity already owns and
+    # manages everything it creates, and naming `agents-deploy` here would force the CLI to
+    # resolve a principal that does not exist yet.
