@@ -26,11 +26,11 @@ no bundle resource type, so `jobs/create_connection.py` creates it during `bundl
 make deploy PROFILE=<profile>    # bundle deploy + bundle run hello_app (ships app code)
 make smoke  PROFILE=<profile>    # initialize / tools/list / tools/call through the UC gateway
 make test lint                   # pytest + ruff (uses uv)
-make destroy PROFILE=<profile>   # bundle destroy, then deletes the UC connection (idempotent)
+make destroy PROFILE=<profile>   # deletes MCP service + connection, then bundle destroy
 ```
 
-`CATALOG` (default `dev_ai`), `SCHEMA` (`hello_mcp`), `SERVICE` (`hello`) and `CONNECTION`
-(`hello_mcp_conn`) are passed to every bundle command and to the smoke test, e.g.
+`CATALOG` (default `dev_ai`), `SCHEMA` (`hello_mcp`), `SERVICE` (`hello`), `CONNECTION`
+(`hello_mcp_conn`) and `APP` (`mcp-hello`) are passed to every bundle command and to the smoke test, e.g.
 `make deploy PROFILE=p SCHEMA=my_schema`. The `dev` target is pinned to
 `https://fe-sandbox-accelerate-ai-gateway.cloud.databricks.com`. Re-running `make deploy` is safe.
 
@@ -49,6 +49,13 @@ passed with `--var`; a commented example is there): `mcp_service_grants` (`EXECU
 `schema_grants` (`USE_SCHEMA`). `USE CATALOG` on the catalog is **not** managed by this bundle
 (the catalog pre-exists), so those principals must already hold it.
 
+Grants are not revoked by other deployments: with an empty list, a principal granted earlier
+(e.g. by a previous version of this bundle, or by hand) keeps its grant on a stack deployed
+elsewhere. Revoke manually, e.g.
+`databricks grants update mcp_service <catalog>.<schema>.<service> --json '{"changes":[{"principal":"account users","remove":["EXECUTE"]}]}'`.
+Access can also be inherited from catalog-level grants (on `dev_ai`, `account users` has
+`ALL_PRIVILEGES` on the catalog), which this bundle does not control.
+
 ## Notes and caveats
 
 - **Auth identity.** The job mints an OAuth secret for the app's service principal only when
@@ -59,8 +66,10 @@ passed with `--var`; a commented example is there): `mcp_service_grants` (`EXECU
   is repaired in place with `connections.update`; this works while the MCP service references it.
   Secrets expire after 2 years; to rotate, delete the connection and redeploy. Old secrets of a
   replaced service principal cannot be revoked by the job (their ids are unknown).
-- `make destroy` runs `bundle destroy` and then deletes the connection (created outside the
-  bundle). The destroy path has not been exercised against the live demo stack.
+- `make destroy` first deletes the MCP service, then the connection (`scripts/teardown.py`; only a
+  confirmed NOT_FOUND is ignored, other errors fail the target), then runs `bundle destroy`: a
+  schema that still contains the connection cannot be dropped. Verified end to end on a scratch
+  schema/app (not on the live demo stack).
 - The bundle does not use `mode: development` so the schema keeps its exact name.
 - `app/requirements.txt` (pip) is used rather than a `uv.lock`: a lock created on a machine with
   an internal PyPI proxy embeds proxy URLs the Apps build cannot reach.

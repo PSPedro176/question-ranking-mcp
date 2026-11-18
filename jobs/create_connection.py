@@ -14,7 +14,7 @@ import argparse
 import sys
 
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.errors import DatabricksError, NotFound
+from databricks.sdk.errors import NotFound
 from databricks.sdk.service.catalog import ConnectionType
 
 BASE_PATH = "/mcp"
@@ -39,15 +39,13 @@ def is_current(existing: dict[str, str] | None, desired: dict[str, str]) -> bool
     return all(existing.get(key) == value for key, value in desired.items())
 
 
-def main(argv: list[str] | None = None, client: WorkspaceClient | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--catalog", required=True)
-    parser.add_argument("--schema", required=True)
-    parser.add_argument("--app_name", required=True)
-    parser.add_argument("--connection_name", required=True)
-    args = parser.parse_args(argv)
+def _describe(exc: BaseException, secret: str | None) -> str:
+    """Error text with the secret value removed; never includes a chained traceback."""
+    text = f"[{type(exc).__name__}] {exc}"
+    return text.replace(secret, "***") if secret else text
 
-    w = client or WorkspaceClient()
+
+def _run(args: argparse.Namespace, w: WorkspaceClient) -> int:
     full_name = f"{args.catalog}.{args.schema}.{args.connection_name}"
     app = w.apps.get(name=args.app_name)
     desired = desired_options(w, app)
@@ -61,11 +59,10 @@ def main(argv: list[str] | None = None, client: WorkspaceClient | None = None) -
         print(f"Connection {full_name} is current ({desired['host']}); nothing to do.")
         return 0
 
+    sp_id = str(app.service_principal_id)
     secret_id = secret = None
     try:
-        minted = w.service_principal_secrets_proxy.create(
-            service_principal_id=str(app.service_principal_id)
-        )
+        minted = w.service_principal_secrets_proxy.create(service_principal_id=sp_id)
         secret_id, secret = minted.id, minted.secret
         options = {**desired, "client_secret": secret}
         if existing is None:
@@ -81,24 +78,36 @@ def main(argv: list[str] | None = None, client: WorkspaceClient | None = None) -
             print(f"Connection {full_name} is stale; updating it -> {desired['host']}{BASE_PATH}")
             w.connections.update(name=full_name, options=options)
     except Exception as exc:
+        print(f"ERROR: {_describe(exc, secret)}", file=sys.stderr)
         if secret_id:
             try:
                 w.service_principal_secrets_proxy.delete(
-                    service_principal_id=str(app.service_principal_id), secret_id=secret_id
+                    service_principal_id=sp_id, secret_id=secret_id
                 )
                 print("Revoked the OAuth secret minted for the failed attempt.", file=sys.stderr)
-            except DatabricksError as revoke_exc:
+            except Exception as revoke_exc:
                 print(
-                    f"WARNING: could not revoke secret {secret_id}: {type(revoke_exc).__name__}",
+                    f"WARNING: could not revoke secret {secret_id}: "
+                    f"{_describe(revoke_exc, secret)}",
                     file=sys.stderr,
                 )
-        message = str(exc)
-        if secret:
-            message = message.replace(secret, "***")
-        print(f"ERROR: [{type(exc).__name__}] {message}", file=sys.stderr)
         return 1
     print(f"Connection {full_name} is ready.")
     return 0
+
+
+def main(argv: list[str] | None = None, client: WorkspaceClient | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--catalog", required=True)
+    parser.add_argument("--schema", required=True)
+    parser.add_argument("--app_name", required=True)
+    parser.add_argument("--connection_name", required=True)
+    args = parser.parse_args(argv)
+    try:
+        return _run(args, client or WorkspaceClient())
+    except Exception as exc:
+        print(f"ERROR: {_describe(exc, None)}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
